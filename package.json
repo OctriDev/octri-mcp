@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "clean": "rm -rf dist",
+    "clean": "rm -rf dist .turbo",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit"
   },
