@@ -3,8 +3,20 @@
 /**
  * Octri MCP Server
  *
- * Exposes API documentation as MCP tools so AI assistants (Claude, Cursor, etc.)
- * can search, retrieve, and navigate your Octri project docs.
+ * Exposes an Octri project to AI assistants (Claude, Cursor, etc.) as MCP tools:
+ *   • Docs tools — search, retrieve, and navigate the project's documentation.
+ *   • Operation tools — one executable tool per included endpoint, shaped by the
+ *     owner's SDK Studio config (names, doc comments, inclusion, deprecation).
+ *     These PERFORM the real API call, using credentials from the env below.
+ *
+ * Env:
+ *   OCTRI_PROJECT_ID / --project-id   the project to expose
+ *   OCTRI_API_URL                     the Octri API (defaults to prod)
+ *   OCTRI_API_BASE_URL                the TARGET API base for operation calls
+ *                                     (falls back to the studio's Base URL)
+ *   OCTRI_API_TOKEN                   bearer / oauth2 token (or basic creds)
+ *   OCTRI_API_KEY (+ _HEADER)         apiKey value (+ header name, def X-API-Key)
+ *   OCTRI_API_USERNAME / _PASSWORD    basic-auth credentials
  *
  * Transports:
  *   stdio (default) — for Claude Desktop / Cursor local integrations
@@ -611,6 +623,152 @@ async function getSdkMethods(
   return formatSdkMethods(data, slug);
 }
 
+// ─── Operation tools (executable, config-derived) ───────────────────────────────
+//
+// One tool per included endpoint, shaped by the owner's SDK Studio config
+// (names, doc comments, inclusion, deprecation). Unlike the docs tools above,
+// these actually PERFORM the API call. Fetched from the public tools endpoint,
+// which returns each tool's JSON-Schema input + an `http` execution mapping.
+
+interface ParamBinding {
+  name: string;
+  wireName: string;
+}
+
+interface HttpConstant {
+  location: "path" | "query" | "body";
+  wireName: string;
+  value: string | number | boolean;
+}
+
+interface HttpMapping {
+  method: string;
+  path: string;
+  pathParams: ParamBinding[];
+  queryParams: ParamBinding[];
+  bodyParams: ParamBinding[];
+  constants: HttpConstant[];
+}
+
+interface OperationTool {
+  slug: string;
+  name: string;
+  description: string;
+  inputSchema: Tool["inputSchema"];
+  deprecated: boolean;
+  http: HttpMapping;
+}
+
+interface McpToolsResponse {
+  tools: OperationTool[];
+  baseUrl: string;
+  auth: string;
+}
+
+// Short-lived per-project cache so a ListTools→CallTool exchange only fetches
+// once; config changes still surface within the TTL.
+const toolCache = new Map<string, { at: number; data: McpToolsResponse }>();
+const TOOL_TTL_MS = 30_000;
+
+async function fetchOperationTools(apiUrl: string, projectId: string): Promise<McpToolsResponse> {
+  const cached = toolCache.get(projectId);
+  if (cached !== undefined && Date.now() - cached.at < TOOL_TTL_MS) return cached.data;
+  const data = await apiFetch<McpToolsResponse>(
+    `${apiUrl}/public/mcp/${encodeURIComponent(projectId)}/tools`,
+  );
+  toolCache.set(projectId, { at: Date.now(), data });
+  return data;
+}
+
+/** Credentials for the target API come from the end-user's env, keyed by scheme. */
+function authHeaders(auth: string): Record<string, string> {
+  const token = process.env["OCTRI_API_TOKEN"] ?? "";
+  const apiKey = process.env["OCTRI_API_KEY"] ?? "";
+  switch (auth) {
+    case "bearer":
+    case "oauth2":
+      return token !== "" ? { Authorization: `Bearer ${token}` } : {};
+    case "apiKey": {
+      const header = process.env["OCTRI_API_KEY_HEADER"] ?? "X-API-Key";
+      return apiKey !== "" ? { [header]: apiKey } : {};
+    }
+    case "basic": {
+      const user = process.env["OCTRI_API_USERNAME"] ?? "";
+      const pass = process.env["OCTRI_API_PASSWORD"] ?? "";
+      if (user !== "" || pass !== "") {
+        return { Authorization: `Basic ${Buffer.from(`${user}:${pass}`).toString("base64")}` };
+      }
+      return token !== "" ? { Authorization: `Basic ${token}` } : {};
+    }
+    default:
+      return {};
+  }
+}
+
+function fillPath(http: HttpMapping, args: Record<string, unknown>): string {
+  let path = http.path;
+  for (const p of http.pathParams) {
+    path = path.replace(`{${p.wireName}}`, encodeURIComponent(String(args[p.name] ?? "")));
+  }
+  for (const c of http.constants) {
+    if (c.location === "path") path = path.replace(`{${c.wireName}}`, encodeURIComponent(String(c.value)));
+  }
+  return path;
+}
+
+/** Build + perform the real API call for one operation tool, return a text result. */
+async function executeOperation(
+  tool: OperationTool,
+  meta: McpToolsResponse,
+  args: Record<string, unknown>,
+): Promise<string> {
+  const baseUrl = (process.env["OCTRI_API_BASE_URL"] ?? meta.baseUrl ?? "").replace(/\/+$/, "");
+  if (baseUrl === "") {
+    return "Error: no API base URL configured. Set OCTRI_API_BASE_URL, or set a Base URL in the SDK Studio (Output tab).";
+  }
+
+  const http = tool.http;
+  const method = http.method.toUpperCase();
+  const path = fillPath(http, args);
+
+  const query = new URLSearchParams();
+  for (const q of http.queryParams) {
+    const v = args[q.name];
+    if (v !== undefined && v !== null && v !== "") query.set(q.wireName, String(v));
+  }
+  for (const c of http.constants) {
+    if (c.location === "query") query.set(c.wireName, String(c.value));
+  }
+  const qs = query.toString();
+
+  let body: string | undefined;
+  const bodyArgs = (args["body"] ?? {}) as Record<string, unknown>;
+  const bodyObj: Record<string, unknown> = {};
+  for (const b of http.bodyParams) {
+    if (bodyArgs[b.name] !== undefined) bodyObj[b.wireName] = bodyArgs[b.name];
+  }
+  for (const c of http.constants) {
+    if (c.location === "body") bodyObj[c.wireName] = c.value;
+  }
+  if (Object.keys(bodyObj).length > 0) body = JSON.stringify(bodyObj);
+
+  const url = `${baseUrl}${path}${qs !== "" ? `?${qs}` : ""}`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...authHeaders(meta.auth),
+    },
+    ...(body !== undefined ? { body } : {}),
+  });
+
+  // Return the raw response (even on 4xx/5xx) so the agent can read the error.
+  const text = await res.text().catch(() => "");
+  const status = `${res.status}${res.statusText !== "" ? ` ${res.statusText}` : ""}`;
+  return `${method} ${url} → ${status}\n\n${text !== "" ? text : "(empty response body)"}`;
+}
+
 // ─── MCP server factory ────────────────────────────────────────────────────────
 
 function buildServer(config: Config): Server {
@@ -619,9 +777,24 @@ function buildServer(config: Config): Server {
     { capabilities: { tools: {} } },
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: TOOLS,
-  }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    // Docs tools are always available; operation tools are config-derived and
+    // fetched live. If the endpoint is unreachable, degrade to docs tools only.
+    let opTools: Tool[] = [];
+    if (config.projectId !== "") {
+      try {
+        const data = await fetchOperationTools(config.apiUrl, config.projectId);
+        opTools = data.tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          inputSchema: t.inputSchema,
+        }));
+      } catch {
+        /* endpoint unreachable — expose docs tools only */
+      }
+    }
+    return { tools: [...TOOLS, ...opTools] };
+  });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
@@ -646,6 +819,18 @@ function buildServer(config: Config): Server {
     }
 
     try {
+      // Operation tools (executable, config-derived) aren't in the static docs
+      // set — resolve + perform the real API call for them.
+      if (!TOOLS.some((t) => t.name === name)) {
+        const data = await fetchOperationTools(config.apiUrl, projectId);
+        const tool = data.tools.find((t) => t.name === name);
+        if (tool !== undefined) {
+          const text = await executeOperation(tool, data, a);
+          return { content: [{ type: "text" as const, text }] };
+        }
+        // Not a known operation tool → fall through to the unknown-tool default.
+      }
+
       let text: string;
 
       switch (name) {
