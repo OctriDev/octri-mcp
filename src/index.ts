@@ -24,6 +24,7 @@
  */
 
 import http from "node:http";
+import { pathToFileURL } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -436,23 +437,24 @@ interface ChangelogEntry {
 interface ChangelogListResponse {
   changelogs: ChangelogEntry[];
   total: number;
+  release?: {
+    revision: number;
+    version: string;
+    publishedAt: string;
+    changelog: string;
+  };
 }
 
-function formatChangelog(
+export function formatChangelog(
   entries: ChangelogEntry[],
   breakingOnly: boolean,
+  release?: ChangelogListResponse["release"],
 ): string {
   const subset = breakingOnly
     ? entries.filter((e) => e.hasBreakingChanges).slice(0, 3)
     : entries.slice(0, 3);
 
-  if (subset.length === 0) {
-    return breakingOnly
-      ? "No breaking changes found in recent history."
-      : "No changelog entries found.";
-  }
-
-  return subset
+  const history = subset
     .map((entry) => {
       const date = new Date(entry.generatedAt).toLocaleDateString("en-US", {
         year: "numeric",
@@ -483,6 +485,23 @@ function formatChangelog(
       return lines.join("\n");
     })
     .join("\n\n---\n\n");
+
+  if (breakingOnly) {
+    return history === "" ? "No breaking changes found in recent history." : history;
+  }
+
+  const note = release?.changelog.trim();
+  const releaseNote = release !== undefined && note !== undefined && note !== ""
+    ? `## Release v${release.version}\n\n${note}`
+    : "";
+  if (releaseNote !== "" && history !== "") return `${releaseNote}\n\n---\n\n${history}`;
+  if (releaseNote !== "") return releaseNote;
+  if (history === "") {
+    return breakingOnly
+      ? "No breaking changes found in recent history."
+      : "No changelog entries found.";
+  }
+  return history;
 }
 
 async function getChangelog(
@@ -493,7 +512,7 @@ async function getChangelog(
   const data = await apiFetch<ChangelogListResponse>(
     `${apiUrl}/public/changelog/${encodeURIComponent(projectId)}`,
   );
-  return formatChangelog(data.changelogs, breakingOnly);
+  return formatChangelog(data.changelogs, breakingOnly, data.release);
 }
 
 // ─── Tool: list_sdks ───────────────────────────────────────────────────────────
@@ -974,7 +993,10 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
-  process.stderr.write(`Fatal: ${String(err)}\n`);
-  process.exit(1);
-});
+const entrypoint = process.argv[1];
+if (entrypoint !== undefined && import.meta.url === pathToFileURL(entrypoint).href) {
+  main().catch((err: unknown) => {
+    process.stderr.write(`Fatal: ${String(err)}\n`);
+    process.exit(1);
+  });
+}
