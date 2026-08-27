@@ -2,6 +2,25 @@
   "name": "@octri/mcp",
   "version": "1.0.0",
   "description": "MCP server for Octri API documentation — use your API docs as context in Claude, Cursor, and more",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "api-docs",
+    "octri",
+    "claude",
+    "cursor",
+    "ai"
+  ],
+  "homepage": "https://octri.dev",
+  "bugs": {
+    "url": "https://octri.dev/support"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/octridev/octri-mcp.git"
+  },
+  "license": "MIT",
+  "author": "Octri",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -12,6 +31,12 @@
     "dist/**",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "build": "tsc",
     "test": "pnpm build && node --test dist/index.test.js",
@@ -20,25 +45,8 @@
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit"
   },
-  "keywords": [
-    "mcp",
-    "model-context-protocol",
-    "api-docs",
-    "octri",
-    "claude",
-    "cursor",
-    "ai"
-  ],
-  "author": "Octri",
-  "license": "MIT",
-  "publishConfig": {
-    "access": "public"
-  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0"
-  },
-  "engines": {
-    "node": ">=20.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0"

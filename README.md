@@ -1,10 +1,26 @@
 # @octri/mcp
 
-MCP (Model Context Protocol) server for [Octri](https://octri.dev) API documentation.
+**An MCP server that turns your API documentation into tools an AI assistant can
+call.** Claude, Cursor, VS Code Copilot, and any other MCP client can search your
+endpoints, open a guide, pull a ready-to-use SDK snippet in any supported
+language, and check the changelog for breaking changes, all from the same
+OpenAPI spec your docs are built from.
 
-Connect your API docs to Claude, Cursor, and any MCP-compatible AI assistant so they can search, navigate, and retrieve your documentation as live context.
+Octri turns an OpenAPI spec into a documentation site, client SDKs for ten
+languages, an MCP server your AI assistant can call, and monitoring for the
+API behind them. This package is the MCP server. See
+[octri.dev/mcp](https://octri.dev/mcp).
 
----
+Node 20 or newer. Runs over stdio for a local client, or SSE when you host it.
+
+## Install
+
+```bash
+npx -y @octri/mcp
+```
+
+Most clients are configured with that command, so a global install is optional.
+The Installation section below has the exact config block for each one.
 
 ## Tools
 
@@ -130,3 +146,33 @@ npm publish --access public
 ```
 
 Requires an npm account with access to the `@octri` scope.
+
+---
+
+## The rest of Octri
+
+| Product | What it does |
+|---|---|
+| [API Studio](https://octri.dev/api-studio) | Your OpenAPI spec becomes a hosted documentation site with a live request playground, editable page by page. |
+| [SDK Studio](https://octri.dev/sdk-studio) | The same spec becomes client libraries for ten languages, versioned and released together. |
+| [MCP](https://octri.dev/mcp) | Your endpoints and docs become tools an AI assistant can call, generated from the same spec. |
+| [Monitoring](https://octri.dev/monitoring) | Errors, traces, uptime and releases for the API, joined to the SDK calls that reached it. |
+
+### Monitoring runtimes
+
+[Node](https://github.com/octridev/octri-node) ·
+[Python](https://github.com/octridev/octri-python) ·
+[Go](https://github.com/octridev/octri-go) ·
+[Ruby](https://github.com/octridev/octri-ruby) ·
+[Rust](https://github.com/octridev/octri-rust) ·
+[PHP](https://github.com/octridev/octri-php) ·
+[Java](https://github.com/octridev/octri-java) ·
+[Kotlin](https://github.com/octridev/octri-kotlin) ·
+[Swift](https://github.com/octridev/octri-swift) ·
+[Dart](https://github.com/octridev/octri-dart)
+
+[Documentation](https://docs.octri.dev/docs) ·
+[Pricing](https://octri.dev/pricing) ·
+[Changelog](https://docs.octri.dev/changelog)
+
+MIT licensed.
