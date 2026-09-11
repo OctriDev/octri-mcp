@@ -4,8 +4,8 @@
  * Octri MCP Server
  *
  * Exposes an Octri project to AI assistants (Claude, Cursor, etc.) as MCP tools:
- *   • Docs tools — search, retrieve, and navigate the project's documentation.
- *   • Operation tools — one executable tool per included endpoint, shaped by the
+ *   - Docs tools: search, retrieve, and navigate the project's documentation.
+ *   - Operation tools: one executable tool per included endpoint, shaped by the
  *     owner's SDK Studio config (names, doc comments, inclusion, deprecation).
  *     These PERFORM the real API call, using credentials from the env below.
  *
@@ -19,8 +19,13 @@
  *   OCTRI_API_USERNAME / _PASSWORD    basic-auth credentials
  *
  * Transports:
- *   stdio (default) — for Claude Desktop / Cursor local integrations
- *   sse             — for remote hosting via Docker (MCP_TRANSPORT=sse)
+ *   stdio (default)   for Claude Desktop / Cursor local integrations
+ *   sse               for remote hosting via Docker (MCP_TRANSPORT=sse)
+ *
+ * SSE env:
+ *   MCP_HOST                          interface to bind (default 127.0.0.1)
+ *   MCP_ALLOWED_ORIGINS               comma-separated browser origins allowed
+ *                                     to reach the transport (default none)
  */
 
 import http from "node:http";
@@ -43,6 +48,10 @@ interface Config {
   apiUrl: string;
   transport: string;
   port: number;
+  /** Interface the SSE transport binds to. Loopback unless deliberately widened. */
+  host: string;
+  /** Browser origins allowed to reach the SSE transport. Empty means none. */
+  allowedOrigins: Set<string>;
 }
 
 function loadConfig(): Config {
@@ -59,6 +68,13 @@ function loadConfig(): Config {
     apiUrl: process.env["OCTRI_API_URL"] ?? DEFAULT_API_URL,
     transport: process.env["MCP_TRANSPORT"] ?? "stdio",
     port: parseInt(process.env["PORT"] ?? "3000", 10),
+    host: process.env["MCP_HOST"] ?? "127.0.0.1",
+    allowedOrigins: new Set(
+      (process.env["MCP_ALLOWED_ORIGINS"] ?? "")
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry !== ""),
+    ),
   };
 }
 
@@ -199,7 +215,7 @@ const TOOLS: Tool[] = [
   {
     name: "get_sdk_methods",
     description:
-      "Show how to call this API through its generated SDKs — ready-to-use code snippets per endpoint in every supported language. Use `slug` (from list_endpoints) to focus on one endpoint, and `language` (e.g. typescript, python, go) to focus on one language.",
+      "Show how to call this API through its generated SDKs. Ready-to-use code snippets per endpoint in every supported language. Use `slug` (from list_endpoints) to focus on one endpoint, and `language` (e.g. typescript, python, go) to focus on one language.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -249,7 +265,7 @@ async function searchDocs(
     .map((r, i) => {
       const badge =
         r.method !== undefined && r.path !== undefined
-          ? ` — \`${r.method} ${r.path}\``
+          ? ` \`${r.method} ${r.path}\``
           : "";
       return `${i + 1}. **${r.title}**${badge}\n   Slug: \`${r.slug}\``;
     })
@@ -323,7 +339,7 @@ function formatEndpoint(data: PageResponse): string {
     if (entries.length > 0) {
       lines.push("## Responses");
       for (const [code, resp] of entries) {
-        const desc = resp.description !== undefined ? ` — ${resp.description}` : "";
+        const desc = resp.description !== undefined ? `: ${resp.description}` : "";
         lines.push(`- **${code}**${desc}`);
       }
       lines.push("");
@@ -394,7 +410,7 @@ function formatNav(data: NavResponse, section: string | undefined): string {
             item.method !== undefined && item.path !== undefined
               ? ` \`${item.method} ${item.path}\``
               : "";
-          return `  - **${item.title}**${badge} — slug: \`${item.slug}\``;
+          return `  - **${item.title}**${badge} (slug: \`${item.slug}\`)`;
         })
         .join("\n");
       return `### ${s.title}\n${items}`;
@@ -462,7 +478,7 @@ export function formatChangelog(
         day: "numeric",
       });
       const breakingTag = entry.hasBreakingChanges
-        ? " — **Breaking changes**"
+        ? " (**Breaking changes**)"
         : "";
       const lines = [
         `## ${entry.fromVersion} → ${entry.toVersion}${breakingTag}`,
@@ -538,7 +554,7 @@ async function listSdks(apiUrl: string, projectId: string): Promise<string> {
   }
 
   const rows = data.builds
-    .map((b) => `- **${b.lang}** — v${b.version} — download: ${b.downloadUrl}`)
+    .map((b) => `- **${b.lang}** v${b.version}, download: ${b.downloadUrl}`)
     .join("\n");
 
   const cdnNote = data.cdnEnabled
@@ -621,7 +637,7 @@ function formatSdkMethods(data: SdkMethodsResponse, slug: string | undefined): s
       const blocks = Object.entries(ep.snippets)
         .map(([lang, code]) => `**${lang}**\n\`\`\`${lang}\n${code}\n\`\`\``)
         .join("\n\n");
-      return `## ${ep.title} — \`${ep.methodName}()\`\n\`${id}\`\n\n${blocks}`;
+      return `## ${ep.title}: \`${ep.methodName}()\`\n\`${id}\`\n\n${blocks}`;
     })
     .join("\n\n---\n\n");
 }
@@ -688,6 +704,8 @@ interface McpToolsResponse {
 // once; config changes still surface within the TTL.
 const toolCache = new Map<string, { at: number; data: McpToolsResponse }>();
 const TOOL_TTL_MS = 30_000;
+// Capped as well, since the project id varies per session over SSE.
+const TOOL_CACHE_MAX = 64;
 
 async function fetchOperationTools(apiUrl: string, projectId: string): Promise<McpToolsResponse> {
   const cached = toolCache.get(projectId);
@@ -695,6 +713,10 @@ async function fetchOperationTools(apiUrl: string, projectId: string): Promise<M
   const data = await apiFetch<McpToolsResponse>(
     `${apiUrl}/public/mcp/${encodeURIComponent(projectId)}/tools`,
   );
+  if (toolCache.size >= TOOL_CACHE_MAX) {
+    const oldest = toolCache.keys().next();
+    if (oldest.done !== true) toolCache.delete(oldest.value);
+  }
   toolCache.set(projectId, { at: Date.now(), data });
   return data;
 }
@@ -735,6 +757,57 @@ function fillPath(http: HttpMapping, args: Record<string, unknown>): string {
   return path;
 }
 
+const OPERATION_TIMEOUT_MS = 30_000;
+const MAX_RESPONSE_BYTES = 1_000_000;
+
+/** Reads at most `limit` bytes of a response body and drops the rest. */
+async function readCapped(res: Response, limit: number): Promise<string> {
+  const body = res.body;
+  if (body === null) return "";
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value === undefined) continue;
+    if (total + value.byteLength > limit) {
+      chunks.push(value.subarray(0, limit - total));
+      truncated = true;
+      await reader.cancel().catch(() => undefined);
+      break;
+    }
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  return truncated ? `${text}\n(truncated at ${limit} bytes)` : text;
+}
+
+/**
+ * Builds the request URL and refuses anything that leaves the base URL's origin.
+ * `path` comes from the stored studio config, and a leading `@` or `//` would
+ * re-point it at another host with the caller's credentials attached.
+ */
+export function resolveOperationUrl(baseUrl: string, path: string, qs: string): URL {
+  const base = new URL(baseUrl);
+  if (base.protocol !== "http:" && base.protocol !== "https:") {
+    throw new Error(`Refusing to call the API: unsupported base URL scheme ${base.protocol}`);
+  }
+  const assembled = new URL(`${baseUrl}${path}${qs !== "" ? `?${qs}` : ""}`);
+  if (
+    assembled.origin !== base.origin ||
+    assembled.username !== "" ||
+    assembled.password !== ""
+  ) {
+    throw new Error(
+      `Refusing to call the API: the operation path leaves the configured base URL (${base.origin}).`,
+    );
+  }
+  return assembled;
+}
+
 /** Build + perform the real API call for one operation tool, return a text result. */
 async function executeOperation(
   tool: OperationTool,
@@ -771,7 +844,13 @@ async function executeOperation(
   }
   if (Object.keys(bodyObj).length > 0) body = JSON.stringify(bodyObj);
 
-  const url = `${baseUrl}${path}${qs !== "" ? `?${qs}` : ""}`;
+  let url: URL;
+  try {
+    url = resolveOperationUrl(baseUrl, path, qs);
+  } catch (err) {
+    return `Error: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
   const res = await fetch(url, {
     method,
     headers: {
@@ -780,10 +859,11 @@ async function executeOperation(
       ...authHeaders(meta.auth),
     },
     ...(body !== undefined ? { body } : {}),
+    signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS),
   });
 
   // Return the raw response (even on 4xx/5xx) so the agent can read the error.
-  const text = await res.text().catch(() => "");
+  const text = await readCapped(res, MAX_RESPONSE_BYTES).catch(() => "");
   const status = `${res.status}${res.statusText !== "" ? ` ${res.statusText}` : ""}`;
   return `${method} ${url} → ${status}\n\n${text !== "" ? text : "(empty response body)"}`;
 }
@@ -809,7 +889,7 @@ function buildServer(config: Config): Server {
           inputSchema: t.inputSchema,
         }));
       } catch {
-        /* endpoint unreachable — expose docs tools only */
+        /* endpoint unreachable, so expose docs tools only */
       }
     }
     return { tools: [...TOOLS, ...opTools] };
@@ -839,7 +919,7 @@ function buildServer(config: Config): Server {
 
     try {
       // Operation tools (executable, config-derived) aren't in the static docs
-      // set — resolve + perform the real API call for them.
+      // set, so resolve + perform the real API call for them.
       if (!TOOLS.some((t) => t.name === name)) {
         const data = await fetchOperationTools(config.apiUrl, projectId);
         const tool = data.tools.find((t) => t.name === name);
@@ -915,6 +995,56 @@ function buildServer(config: Config): Server {
 
 // ─── SSE transport (remote hosting) ───────────────────────────────────────────
 
+const MAX_SSE_SESSIONS = 64;
+
+/** Drops a trailing `:port`, unwrapping a bracketed IPv6 literal on the way. */
+function bareHost(host: string): string {
+  const trimmed = host.trim().toLowerCase();
+  if (trimmed.startsWith("[")) {
+    const end = trimmed.indexOf("]");
+    return end === -1 ? trimmed.slice(1) : trimmed.slice(1, end);
+  }
+  // One colon is host:port. More than one is a bare IPv6 address.
+  const parts = trimmed.split(":");
+  return parts.length === 2 ? (parts[0] ?? "") : trimmed;
+}
+
+function isLoopback(host: string): boolean {
+  const bare = bareHost(host);
+  return bare === "localhost" || bare === "::1" || /^127\.\d+\.\d+\.\d+$/.test(bare);
+}
+
+/**
+ * Guards the SSE transport against a browser on the same machine. This server
+ * holds API credentials, and any page the user visits can reach a loopback port.
+ * An unlisted `Origin` marks a browser request and is refused; a non-loopback
+ * `Host` catches DNS rebinding, which otherwise arrives looking local.
+ *
+ * Returns an error string when the request must be refused.
+ */
+export function sseRequestRefusal(
+  headers: http.IncomingHttpHeaders,
+  config: Pick<Config, "host" | "allowedOrigins">,
+): string | null {
+  const origin = headers.origin;
+  if (typeof origin === "string" && origin !== "") {
+    if (!config.allowedOrigins.has(origin)) {
+      return `Origin ${origin} is not allowed. Set MCP_ALLOWED_ORIGINS to permit it.`;
+    }
+  }
+
+  // Only meaningful while bound to loopback. A widened MCP_HOST means the
+  // operator is fronting this themselves.
+  if (isLoopback(config.host)) {
+    const host = headers.host ?? "";
+    if (!isLoopback(host)) {
+      return `Host ${host === "" ? "(missing)" : host} is not the loopback interface.`;
+    }
+  }
+
+  return null;
+}
+
 async function startSse(config: Config): Promise<void> {
   const sessions = new Map<string, SSEServerTransport>();
 
@@ -924,8 +1054,20 @@ async function startSse(config: Config): Promise<void> {
       `http://localhost:${config.port}`,
     );
 
-    // GET /sse — open a new SSE connection
+    const refusal = sseRequestRefusal(req.headers, config);
+    if (refusal !== null) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `Forbidden: ${refusal}` }));
+      return;
+    }
+
+    // GET /sse: open a new SSE connection
     if (req.method === "GET" && url.pathname === "/sse") {
+      if (sessions.size >= MAX_SSE_SESSIONS) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Too many open sessions" }));
+        return;
+      }
       const transport = new SSEServerTransport("/messages", res);
       sessions.set(transport.sessionId, transport);
 
@@ -940,7 +1082,7 @@ async function startSse(config: Config): Promise<void> {
       return;
     }
 
-    // POST /messages?sessionId=X — forward client message to the right session
+    // POST /messages?sessionId=X: forward client message to the right session
     if (req.method === "POST" && url.pathname === "/messages") {
       const sessionId = url.searchParams.get("sessionId") ?? "";
       const transport = sessions.get(sessionId);
@@ -962,11 +1104,11 @@ async function startSse(config: Config): Promise<void> {
   });
 
   await new Promise<void>((resolve) => {
-    httpServer.listen(config.port, resolve);
+    httpServer.listen(config.port, config.host, resolve);
   });
 
   process.stderr.write(
-    `Octri MCP server (SSE) listening on http://0.0.0.0:${config.port}\n`,
+    `Octri MCP server (SSE) listening on http://${config.host}:${config.port}\n`,
   );
   process.stderr.write(
     `  SSE endpoint:  GET  /sse\n  Message relay: POST /messages?sessionId=<id>\n`,

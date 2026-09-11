@@ -1,6 +1,6 @@
 {
   "name": "@octri/mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server for Octri API documentation — use your API docs as context in Claude, Cursor, and more",
   "keywords": [
     "mcp",
@@ -30,7 +30,8 @@
   "files": [
     "dist/**",
     "!dist/**/*.test.*",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "publishConfig": {
     "access": "public"
@@ -40,7 +41,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "pnpm build && node --test dist/index.test.js",
+    "test": "pnpm build && node --test dist/*.test.js",
     "dev": "tsc --watch",
     "clean": "rm -rf dist .turbo",
     "lint": "tsc --noEmit",

@@ -116,8 +116,8 @@ docker run -p 3000:3000 \
 
 The container exposes two endpoints:
 
-- `GET /sse` — opens an SSE connection (configure this URL in your MCP client)
-- `POST /messages?sessionId=<id>` — relay endpoint for client-to-server messages
+- `GET /sse` opens an SSE connection (configure this URL in your MCP client)
+- `POST /messages?sessionId=<id>` is the relay endpoint for client-to-server messages
 
 Configure a remote MCP client to connect to `http://your-host:3000/sse`.
 
