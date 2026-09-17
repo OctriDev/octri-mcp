@@ -11,7 +11,8 @@ languages, an MCP server your AI assistant can call, and monitoring for the
 API behind them. This package is the MCP server. See
 [octri.dev/mcp](https://octri.dev/mcp).
 
-Node 20 or newer. Runs over stdio for a local client, or SSE when you host it.
+Node 20 or newer. Runs over stdio for a local client, or Streamable HTTP when
+you host it.
 
 ## Install
 
@@ -95,31 +96,65 @@ Add to `.vscode/mcp.json`:
 |----------|----------|---------|-------------|
 | `OCTRI_PROJECT_ID` | Yes* | — | The project to connect to. Can also be set via `--project-id` CLI flag. |
 | `OCTRI_API_URL` | No | `https://api.octri.dev/api/v1` | Override the API base URL (useful for self-hosted deployments). |
-| `MCP_TRANSPORT` | No | `stdio` | Set to `sse` for remote/Docker hosting. |
-| `PORT` | No | `3000` | HTTP port when using SSE transport. |
+| `MCP_TRANSPORT` | No | `stdio` | `http` for remote hosting (Streamable HTTP), or `sse` for the legacy transport. |
+| `PORT` | No | `3000` | HTTP port for the `http` and `sse` transports. |
+| `MCP_HOST` | No | `127.0.0.1` | Interface to bind. Widen only behind a proxy you control. |
+| `MCP_ALLOWED_ORIGINS` | No | — | Comma-separated browser origins allowed to reach an HTTP transport. |
 
 \* Required unless every tool call passes `projectId` explicitly.
 
+### Credentials for the API being called
+
+Operation tools call your real API, and these supply its credentials:
+
+| Variable | Description |
+|----------|-------------|
+| `OCTRI_API_BASE_URL` | Target API base for operation calls (falls back to the studio's Base URL). |
+| `OCTRI_API_TOKEN` | Bearer / OAuth2 token. |
+| `OCTRI_API_KEY` (+ `OCTRI_API_KEY_HEADER`) | API-key value, and the header it goes in (default `X-API-Key`). |
+| `OCTRI_API_USERNAME` / `OCTRI_API_PASSWORD` | Basic-auth credentials. |
+
+All of these are sent as **HTTP headers**. An API that takes its credentials in
+the request *body* instead — Plaid's `client_id` and `secret`, for example — is
+not served by them: those are ordinary body fields, so they appear as tool
+arguments and the agent passes them like any other field. Setting
+`OCTRI_API_KEY` for such an API adds a header it ignores.
+
 ---
 
-## Remote hosting (Docker / SSE transport)
+## Remote hosting
 
-The server supports SSE (Server-Sent Events) transport for remote deployment:
+Use **Streamable HTTP** (`MCP_TRANSPORT=http`), the transport the MCP spec has
+defined for remote servers since revision 2025-03-26 and the one a current
+client tries first:
 
 ```bash
 docker build -t octri-mcp .
 
 docker run -p 3000:3000 \
+  -e MCP_TRANSPORT=http \
   -e OCTRI_PROJECT_ID=YOUR_PROJECT_ID \
   octri-mcp
 ```
 
-The container exposes two endpoints:
+It serves a single endpoint — `POST /mcp` — and runs statelessly, so requests
+carry no session and any number of replicas can sit behind a load balancer.
+Point a remote MCP client at `http://your-host:3000/mcp`.
 
-- `GET /sse` opens an SSE connection (configure this URL in your MCP client)
-- `POST /messages?sessionId=<id>` is the relay endpoint for client-to-server messages
+### Legacy HTTP+SSE transport
 
-Configure a remote MCP client to connect to `http://your-host:3000/sse`.
+`MCP_TRANSPORT=sse` serves the older 2024-11-05 design, kept so existing
+deployments keep working. It exposes `GET /sse` to open a connection and
+`POST /messages?sessionId=<id>` to relay client messages. Prefer `http` for
+anything new.
+
+### Binding and origins
+
+Both HTTP transports bind `127.0.0.1` by default and refuse any request whose
+`Origin` is not listed in `MCP_ALLOWED_ORIGINS`, or whose `Host` is not
+loopback. This server holds your API credentials, and any page the browser
+visits can reach a loopback port — so widen `MCP_HOST` only behind a proxy you
+control, and list origins explicitly.
 
 ---
 
@@ -132,7 +167,10 @@ pnpm build
 # Run in stdio mode
 OCTRI_PROJECT_ID=my-project node dist/index.js
 
-# Run in SSE mode
+# Run in Streamable HTTP mode (POST /mcp)
+MCP_TRANSPORT=http OCTRI_PROJECT_ID=my-project node dist/index.js
+
+# Run in the legacy SSE mode
 MCP_TRANSPORT=sse OCTRI_PROJECT_ID=my-project node dist/index.js
 ```
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { resolveOperationUrl, sseRequestRefusal } from "./index.js";
+import { resolveOperationUrl, httpRequestRefusal } from "./index.js";
 
 describe("operation URL resolution", () => {
   const base = "https://api.example.test";
@@ -26,15 +26,15 @@ describe("operation URL resolution", () => {
   });
 });
 
-describe("SSE transport guard", () => {
+describe("HTTP transport guard", () => {
   const loopback = { host: "127.0.0.1", allowedOrigins: new Set<string>() };
 
   it("allows a non-browser request to the loopback interface", () => {
-    assert.equal(sseRequestRefusal({ host: "127.0.0.1:3000" }, loopback), null);
+    assert.equal(httpRequestRefusal({ host: "127.0.0.1:3000" }, loopback), null);
   });
 
   it("refuses a request carrying an unlisted browser origin", () => {
-    const refusal = sseRequestRefusal(
+    const refusal = httpRequestRefusal(
       { host: "localhost:3000", origin: "https://evil.test" },
       loopback,
     );
@@ -43,7 +43,7 @@ describe("SSE transport guard", () => {
 
   it("allows an origin the operator listed", () => {
     assert.equal(
-      sseRequestRefusal(
+      httpRequestRefusal(
         { host: "localhost:3000", origin: "https://app.example.test" },
         { host: "127.0.0.1", allowedOrigins: new Set(["https://app.example.test"]) },
       ),
@@ -53,23 +53,23 @@ describe("SSE transport guard", () => {
 
   it("treats the IPv6 loopback as local, bare or bracketed", () => {
     assert.equal(
-      sseRequestRefusal({ host: "[::1]:3000" }, { host: "::1", allowedOrigins: new Set<string>() }),
+      httpRequestRefusal({ host: "[::1]:3000" }, { host: "::1", allowedOrigins: new Set<string>() }),
       null,
     );
     assert.match(
-      sseRequestRefusal({ host: "attacker.test" }, { host: "::1", allowedOrigins: new Set<string>() }) ?? "",
+      httpRequestRefusal({ host: "attacker.test" }, { host: "::1", allowedOrigins: new Set<string>() }) ?? "",
       /not the loopback interface/,
     );
   });
 
   it("refuses a rebound host while bound to loopback", () => {
-    const refusal = sseRequestRefusal({ host: "attacker.test" }, loopback);
+    const refusal = httpRequestRefusal({ host: "attacker.test" }, loopback);
     assert.match(refusal ?? "", /not the loopback interface/);
   });
 
   it("leaves the host check to the operator once MCP_HOST is widened", () => {
     assert.equal(
-      sseRequestRefusal(
+      httpRequestRefusal(
         { host: "mcp.internal:3000" },
         { host: "0.0.0.0", allowedOrigins: new Set<string>() },
       ),
