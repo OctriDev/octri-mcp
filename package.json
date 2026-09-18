@@ -1,7 +1,7 @@
 {
   "name": "@octri/mcp",
-  "version": "1.0.1",
-  "description": "MCP server for Octri API documentation — use your API docs as context in Claude, Cursor, and more",
+  "version": "1.1.0",
+  "description": "MCP server for Octri API documentation \u2014 use your API docs as context in Claude, Cursor, and more",
   "keywords": [
     "mcp",
     "model-context-protocol",
