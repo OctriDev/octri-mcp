@@ -1,0 +1,83 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "dev.octri/mcp",
+  "title": "Octri API Docs",
+  "description": "Search an Octri project's API docs and call its endpoints as tools, shaped by its SDK Studio config.",
+  "websiteUrl": "https://octri.dev",
+  "repository": {
+    "url": "https://github.com/octridev/octri-mcp",
+    "source": "github"
+  },
+  "icons": [
+    {
+      "src": "https://octri.dev/logo/octri_favicon.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": ["any"]
+    },
+    {
+      "src": "https://octri.dev/logo/octri_favicon_192.png",
+      "mimeType": "image/png",
+      "sizes": ["192x192"]
+    }
+  ],
+  "version": "1.1.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@octri/mcp",
+      "version": "1.1.1",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OCTRI_PROJECT_ID",
+          "description": "The Octri project whose docs and endpoints this server exposes.",
+          "isRequired": true,
+          "format": "string"
+        },
+        {
+          "name": "OCTRI_API_BASE_URL",
+          "description": "Base URL for endpoint calls. Defaults to the Base URL set in the project's SDK Studio.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "OCTRI_API_TOKEN",
+          "description": "Bearer or OAuth2 token for the documented API, not for Octri.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "OCTRI_API_KEY",
+          "description": "API key for the documented API, not for Octri. Sent in the OCTRI_API_KEY_HEADER header.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "OCTRI_API_KEY_HEADER",
+          "description": "Header that carries OCTRI_API_KEY.",
+          "isRequired": false,
+          "default": "X-API-Key",
+          "format": "string"
+        },
+        {
+          "name": "OCTRI_API_USERNAME",
+          "description": "Basic-auth username for the documented API.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "OCTRI_API_PASSWORD",
+          "description": "Basic-auth password for the documented API.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

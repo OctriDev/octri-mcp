@@ -1,10 +1,17 @@
 # Changelog
 
+## 1.1.1
+
+- Listed in the official MCP Registry as `dev.octri/mcp`. `package.json` carries
+  the `mcpName` the registry checks ownership against, and `server.json`
+  describes the stdio launch and its environment variables for clients that
+  install from the registry. No change to the server itself.
+
 ## 1.1.0
 
 - `npx @octri/mcp` starts again. The entry-point guard compared the path the
-  process was invoked with against this module's resolved path, and npm and npx
-  publish `bin` entries as symlinks — so the two never matched, `main()` never
+  process was invoked with against this module's resolved path. npm and npx
+  publish `bin` entries as symlinks, so the two never matched: `main()` never
   ran, and the server exited 0 without a word. Every client config in the docs
   was affected.
 - A body-bearing method always sends a JSON body, `{}` when nothing was filled
