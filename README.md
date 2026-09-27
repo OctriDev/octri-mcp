@@ -23,6 +23,14 @@ npx -y @octri/mcp
 Most clients are configured with that command, so a global install is optional.
 The Installation section below has the exact config block for each one.
 
+Or install it in one click. VS Code asks for your project ID; Cursor writes
+`YOUR_PROJECT_ID` into its `mcp.json` for you to replace.
+
+[![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=octri-api-docs&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBvY3RyaS9tY3AiXSwiZW52Ijp7Ik9DVFJJX1BST0pFQ1RfSUQiOiJZT1VSX1BST0pFQ1RfSUQifX0%3D)
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect/mcp/install?name=octri-api-docs&inputs=%5B%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22octri_project_id%22%2C%22description%22%3A%22Octri%20project%20ID%22%7D%5D&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40octri%2Fmcp%22%5D%2C%22env%22%3A%7B%22OCTRI_PROJECT_ID%22%3A%22%24%7Binput%3Aoctri_project_id%7D%22%7D%7D)
+
+Listed in the official MCP Registry as `dev.octri/mcp`.
+
 ## Tools
 
 | Tool | Description |
@@ -94,12 +102,12 @@ Add to `.vscode/mcp.json`:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `OCTRI_PROJECT_ID` | Yes* | — | The project to connect to. Can also be set via `--project-id` CLI flag. |
+| `OCTRI_PROJECT_ID` | Yes* | None | The project to connect to. Can also be set via `--project-id` CLI flag. |
 | `OCTRI_API_URL` | No | `https://api.octri.dev/api/v1` | Override the API base URL (useful for self-hosted deployments). |
 | `MCP_TRANSPORT` | No | `stdio` | `http` for remote hosting (Streamable HTTP), or `sse` for the legacy transport. |
 | `PORT` | No | `3000` | HTTP port for the `http` and `sse` transports. |
 | `MCP_HOST` | No | `127.0.0.1` | Interface to bind. Widen only behind a proxy you control. |
-| `MCP_ALLOWED_ORIGINS` | No | — | Comma-separated browser origins allowed to reach an HTTP transport. |
+| `MCP_ALLOWED_ORIGINS` | No | None | Comma-separated browser origins allowed to reach an HTTP transport. |
 
 \* Required unless every tool call passes `projectId` explicitly.
 
@@ -115,7 +123,7 @@ Operation tools call your real API, and these supply its credentials:
 | `OCTRI_API_USERNAME` / `OCTRI_API_PASSWORD` | Basic-auth credentials. |
 
 All of these are sent as **HTTP headers**. An API that takes its credentials in
-the request *body* instead — Plaid's `client_id` and `secret`, for example — is
+the request *body* instead (Plaid's `client_id` and `secret`, for example) is
 not served by them: those are ordinary body fields, so they appear as tool
 arguments and the agent passes them like any other field. Setting
 `OCTRI_API_KEY` for such an API adds a header it ignores.
@@ -137,7 +145,7 @@ docker run -p 3000:3000 \
   octri-mcp
 ```
 
-It serves a single endpoint — `POST /mcp` — and runs statelessly, so requests
+It serves a single endpoint, `POST /mcp`, and runs statelessly, so requests
 carry no session and any number of replicas can sit behind a load balancer.
 Point a remote MCP client at `http://your-host:3000/mcp`.
 
@@ -153,7 +161,7 @@ anything new.
 Both HTTP transports bind `127.0.0.1` by default and refuse any request whose
 `Origin` is not listed in `MCP_ALLOWED_ORIGINS`, or whose `Host` is not
 loopback. This server holds your API credentials, and any page the browser
-visits can reach a loopback port — so widen `MCP_HOST` only behind a proxy you
+visits can reach a loopback port. Widen `MCP_HOST` only behind a proxy you
 control, and list origins explicitly.
 
 ---
