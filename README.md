@@ -106,8 +106,9 @@ Add to `.vscode/mcp.json`:
 | `OCTRI_API_URL` | No | `https://api.octri.dev/api/v1` | Override the API base URL (useful for self-hosted deployments). |
 | `MCP_TRANSPORT` | No | `stdio` | `http` for remote hosting (Streamable HTTP), or `sse` for the legacy transport. |
 | `PORT` | No | `3000` | HTTP port for the `http` and `sse` transports. |
-| `MCP_HOST` | No | `127.0.0.1` | Interface to bind. Widen only behind a proxy you control. |
+| `MCP_HOST` | No | `127.0.0.1` | Interface to bind. Widening it requires `MCP_AUTH_TOKEN`. |
 | `MCP_ALLOWED_ORIGINS` | No | None | Comma-separated browser origins allowed to reach an HTTP transport. |
+| `MCP_AUTH_TOKEN` | When `MCP_HOST` is not loopback | None | Bearer token every HTTP request must send as `Authorization: Bearer <token>`. |
 
 \* Required unless every tool call passes `projectId` explicitly.
 
@@ -161,8 +162,12 @@ anything new.
 Both HTTP transports bind `127.0.0.1` by default and refuse any request whose
 `Origin` is not listed in `MCP_ALLOWED_ORIGINS`, or whose `Host` is not
 loopback. This server holds your API credentials, and any page the browser
-visits can reach a loopback port. Widen `MCP_HOST` only behind a proxy you
-control, and list origins explicitly.
+visits can reach a loopback port.
+
+Widening `MCP_HOST` puts those credentials on the network, so the server then
+refuses to start without `MCP_AUTH_TOKEN`, and every request must send
+`Authorization: Bearer <token>`. Configure the same header in your MCP client,
+and list browser origins explicitly.
 
 ---
 

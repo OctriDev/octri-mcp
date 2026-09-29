@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { resolveOperationUrl, httpRequestRefusal } from "./index.js";
+import { resolveOperationUrl, httpRequestRefusal, httpStartupRefusal } from "./index.js";
 
 describe("operation URL resolution", () => {
   const base = "https://api.example.test";
@@ -73,6 +73,33 @@ describe("HTTP transport guard", () => {
         { host: "mcp.internal:3000" },
         { host: "0.0.0.0", allowedOrigins: new Set<string>() },
       ),
+      null,
+    );
+  });
+});
+
+// Every request this server answers is made with the operator's API
+// credentials. Bound beyond loopback, anyone who could reach the port used them.
+describe("HTTP transport token", () => {
+  const widened = { host: "0.0.0.0", allowedOrigins: new Set<string>(), authToken: "s3cret-token" };
+
+  it("refuses to start off loopback without MCP_AUTH_TOKEN", () => {
+    assert.match(httpStartupRefusal({ host: "0.0.0.0", authToken: "" }) ?? "", /Set MCP_AUTH_TOKEN/);
+    assert.equal(httpStartupRefusal({ host: "0.0.0.0", authToken: "s3cret-token" }), null);
+    assert.equal(httpStartupRefusal({ host: "127.0.0.1", authToken: "" }), null);
+  });
+
+  it("refuses a request without the token, or with the wrong one", () => {
+    assert.match(httpRequestRefusal({ host: "mcp.example.test" }, widened) ?? "", /Bearer token is required/);
+    assert.match(
+      httpRequestRefusal({ host: "mcp.example.test", authorization: "Bearer wrong" }, widened) ?? "",
+      /Bearer token is required/,
+    );
+  });
+
+  it("serves a request that presents the token", () => {
+    assert.equal(
+      httpRequestRefusal({ host: "mcp.example.test", authorization: "Bearer s3cret-token" }, widened),
       null,
     );
   });

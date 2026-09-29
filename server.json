@@ -20,12 +20,12 @@
       "sizes": ["192x192"]
     }
   ],
-  "version": "1.1.1",
+  "version": "1.2.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@octri/mcp",
-      "version": "1.1.1",
+      "version": "1.2.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

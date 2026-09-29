@@ -38,8 +38,11 @@
  *   MCP_HOST                          interface to bind (default 127.0.0.1)
  *   MCP_ALLOWED_ORIGINS               comma-separated browser origins allowed
  *                                     to reach the transport (default none)
+ *   MCP_AUTH_TOKEN                    bearer token every request must present.
+ *                                     Required once MCP_HOST is not loopback.
  */
 
+import { timingSafeEqual } from "node:crypto";
 import { realpathSync } from "node:fs";
 import http from "node:http";
 import { createRequire } from "node:module";
@@ -82,6 +85,8 @@ interface Config {
   host: string;
   /** Browser origins allowed to reach the SSE transport. Empty means none. */
   allowedOrigins: Set<string>;
+  /** Bearer token every HTTP request must carry. Empty means none is asked for. */
+  authToken: string;
 }
 
 function loadConfig(): Config {
@@ -105,6 +110,7 @@ function loadConfig(): Config {
         .map((entry) => entry.trim())
         .filter((entry) => entry !== ""),
     ),
+    authToken: process.env["MCP_AUTH_TOKEN"] ?? "",
   };
 }
 
@@ -1208,13 +1214,20 @@ function isLoopback(host: string): boolean {
  */
 export function httpRequestRefusal(
   headers: http.IncomingHttpHeaders,
-  config: Pick<Config, "host" | "allowedOrigins">,
+  config: Pick<Config, "host" | "allowedOrigins"> & Partial<Pick<Config, "authToken">>,
 ): string | null {
   const origin = headers.origin;
   if (typeof origin === "string" && origin !== "") {
     if (!config.allowedOrigins.has(origin)) {
       return `Origin ${origin} is not allowed. Set MCP_ALLOWED_ORIGINS to permit it.`;
     }
+  }
+
+  // Every request answers with this server's API credentials, so once it is
+  // reachable from the network the caller has to prove who it is.
+  const token = config.authToken ?? "";
+  if (token !== "" && !sameSecret(headers.authorization ?? "", `Bearer ${token}`)) {
+    return "A valid Authorization: Bearer token is required.";
   }
 
   // Only meaningful while bound to loopback. A widened MCP_HOST means the
@@ -1227,6 +1240,24 @@ export function httpRequestRefusal(
   }
 
   return null;
+}
+
+/** Constant-time comparison, so response timing says nothing about the token. */
+function sameSecret(presented: string, expected: string): boolean {
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/**
+ * Refuses to serve HTTP on a non-loopback interface without MCP_AUTH_TOKEN.
+ * Bound wider, anyone who can reach the port used the operator's API
+ * credentials, and the README's "behind a proxy you control" was the only
+ * thing in the way.
+ */
+export function httpStartupRefusal(config: Pick<Config, "host" | "authToken">): string | null {
+  if (isLoopback(config.host) || config.authToken !== "") return null;
+  return `MCP_HOST=${config.host} is not the loopback interface. Set MCP_AUTH_TOKEN so only callers with the token can use this server.`;
 }
 
 async function startSse(config: Config): Promise<void> {
@@ -1384,6 +1415,11 @@ async function startStreamableHttp(config: Config): Promise<void> {
 
 async function main(): Promise<void> {
   const config = loadConfig();
+
+  if (["http", "streamable-http", "sse"].includes(config.transport)) {
+    const refusal = httpStartupRefusal(config);
+    if (refusal !== null) throw new Error(refusal);
+  }
 
   if (config.transport === "http" || config.transport === "streamable-http") {
     await startStreamableHttp(config);

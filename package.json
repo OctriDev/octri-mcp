@@ -1,6 +1,6 @@
 {
   "name": "@octri/mcp",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "mcpName": "dev.octri/mcp",
   "description": "MCP server for an Octri project: search its API docs and call its endpoints from Claude, Cursor, and other clients",
   "keywords": [

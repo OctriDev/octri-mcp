@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0
+
+- An HTTP transport bound beyond loopback (`MCP_HOST` set to anything but
+  `127.0.0.1`, `localhost` or `::1`) now requires `MCP_AUTH_TOKEN`, and every
+  request must send `Authorization: Bearer <token>`. Without it the server
+  refuses to start. Every call this server makes uses your API credentials, so
+  anyone who could reach the port could use them. **Breaking** for deployments
+  that widen `MCP_HOST`: set the token, and the same header in your client.
+  stdio and loopback-only setups are unaffected.
+
 ## 1.1.1
 
 - Listed in the official MCP Registry as `dev.octri/mcp`. `package.json` carries
