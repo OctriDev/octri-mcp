@@ -11,6 +11,7 @@ import {
   isDirectRun,
   missingRequired,
   operationAnnotations,
+  serializeRequestBody,
   type HttpMapping,
 } from "./index.js";
 
@@ -135,6 +136,110 @@ describe("request body construction", () => {
       client_id: "abc",
     });
   });
+
+  it("keeps root object fields while injecting body constants without bindings", () => {
+    const rootObject: HttpMapping = {
+      ...http,
+      bodyParams: [],
+      constants: [{ location: "body", wireName: "kind", value: "fixture" }],
+    };
+    assert.deepEqual(JSON.parse(buildRequestBody(rootObject, { body: { name: "Ada" } }, "POST") ?? "null"), {
+      name: "Ada",
+      kind: "fixture",
+    });
+  });
+});
+
+describe("persisted operation media serializers", () => {
+  const base: HttpMapping = {
+    method: "POST", path: "/upload", pathParams: [], queryParams: [], bodyParams: [], constants: [],
+  };
+
+  it("keeps nested form arrays on bracketed wire keys", () => {
+    const encoded = serializeRequestBody(
+      { ...base, requestBody: { contentType: "application/x-www-form-urlencoded" } },
+      { body: { customer: { name: "Ada" }, tags: ["a", "b"] } },
+      "POST",
+    );
+    assert.equal(encoded.contentType, "application/x-www-form-urlencoded");
+    assert.equal(encoded.body, "customer%5Bname%5D=Ada&tags%5B%5D=a&tags%5B%5D=b");
+  });
+
+  it("honors explicit form repeated, CSV, and flat-object encodings", () => {
+    const encoded = serializeRequestBody(
+      {
+        ...base,
+        requestBody: {
+          contentType: "application/x-www-form-urlencoded",
+          encoding: {
+            repeated: { style: "form", explode: true },
+            csv: { style: "form", explode: false },
+            labels: { style: "form", explode: true },
+            compact: { style: "form", explode: false },
+          },
+        },
+      },
+      { body: { repeated: ["a", "b"], csv: ["c", "d"], labels: { role: "admin", scope: "all" }, compact: { R: 100, G: 200 } } },
+      "POST",
+    );
+    const form = new URLSearchParams(encoded.body as string);
+    assert.deepEqual(form.getAll("repeated"), ["a", "b"]);
+    assert.equal(form.get("csv"), "c,d");
+    assert.equal(form.get("role"), "admin");
+    assert.equal(form.get("scope"), "all");
+    assert.equal(form.get("compact"), "R,100,G,200");
+  });
+
+  it("refuses urlencoded directives this MCP boundary cannot serialize", () => {
+    const configured = (encoding: Record<string, unknown>) => serializeRequestBody(
+      { ...base, requestBody: { contentType: "application/x-www-form-urlencoded", encoding: { field: encoding } } },
+      { body: { field: "value" } },
+      "POST",
+    );
+    assert.throws(() => configured({ style: "deepObject" }), /Unsupported form encoding style/);
+    assert.throws(() => configured({ headers: { "X-Part": { schema: { type: "string" } } } }), /form part headers/);
+  });
+
+  it("uses multipart boundaries and inline base64 files without filesystem inputs", () => {
+    const encoded = serializeRequestBody(
+      { ...base, requestBody: { contentType: "multipart/form-data", schema: { type: "object", properties: { file: { type: "string", format: "binary" } } } } },
+      { body: { file: { filename: "note.txt", content: Buffer.from("hello").toString("base64"), contentType: "text/plain" } } },
+      "POST",
+    );
+    assert.equal(encoded.contentType, undefined);
+    assert.ok(encoded.body instanceof FormData);
+  });
+
+  it("keeps ordinary multipart filename/content objects as JSON data", async () => {
+    const encoded = serializeRequestBody(
+      { ...base, requestBody: { contentType: "multipart/form-data" } },
+      { body: { metadata: { filename: "display-name", content: "plain-text" } } },
+      "POST",
+    );
+    assert.ok(encoded.body instanceof FormData);
+    const part = encoded.body.get("metadata");
+    assert.ok(part instanceof Blob);
+    assert.equal(part.type, "application/json");
+    assert.deepEqual(JSON.parse(await part.text()), { filename: "display-name", content: "plain-text" });
+  });
+
+  it("keeps JSON Patch, text, and binary root bodies in their documented media", () => {
+    assert.equal(
+      serializeRequestBody({ ...base, requestBody: { contentType: "application/json-patch+json" } }, { body: [{ op: "replace" }] }, "PATCH").contentType,
+      "application/json-patch+json",
+    );
+    assert.equal(
+      serializeRequestBody({ ...base, requestBody: { contentType: "text/plain" } }, { body: "raw" }, "POST").body,
+      "raw",
+    );
+    const binary = serializeRequestBody(
+      { ...base, requestBody: { contentType: "application/octet-stream" } },
+      { body: { filename: "x.bin", content: "AAE=" } },
+      "POST",
+    );
+    assert.equal(binary.contentType, "application/octet-stream");
+    assert.deepEqual(Buffer.from(binary.body as Uint8Array), Buffer.from([0, 1]));
+  });
 });
 
 describe("required argument validation", () => {
@@ -157,6 +262,17 @@ describe("required argument validation", () => {
 
   it("reports a missing required body field", () => {
     assert.deepEqual(missingRequired(schema, { consentId: "c1", body: {} }), ["body.accessToken"]);
+  });
+
+  it("checks child requirements only when optional root body is supplied", () => {
+    const optionalRoot = {
+      type: "object" as const,
+      properties: {
+        body: { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+      },
+    };
+    assert.deepEqual(missingRequired(optionalRoot, {}), []);
+    assert.deepEqual(missingRequired(optionalRoot, { body: {} }), ["body.name"]);
   });
 
   it("treats empty string and null as absent", () => {

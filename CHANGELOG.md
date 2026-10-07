@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.1
+
+- Operation tools retain documented request media, parameter locations, and
+  serialization. JSON/+json, JSON Patch, form, multipart, text, and bounded
+  inline binary bodies reach their documented wire format. Multipart and binary
+  files accept only `{ filename, content: base64, contentType? }`; server never
+  reads local paths or fetches URLs for tool arguments.
+- Declared header and cookie parameters, query arrays, and provider-specific
+  Slack `{"ok":false,"error":"..."}` error envelopes now reach MCP execution correctly.
+- Explicit form `style: form` supports scalar arrays and objects with explode
+  controls. Unsupported form directives and multipart style/explode/part headers
+  fail before the upstream call; multipart part content types are supported.
+- Inline files are limited to 10 MiB decoded; transport request limits can
+  impose a lower bound on incoming JSON messages.
+
 ## 1.2.0
 
 - An HTTP transport bound beyond loopback (`MCP_HOST` set to anything but

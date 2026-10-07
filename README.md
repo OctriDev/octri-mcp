@@ -14,6 +14,11 @@ API behind them. This package is the MCP server. See
 Node 20 or newer. Runs over stdio for a local client, or Streamable HTTP when
 you host it.
 
+Operation bodies use documented media type. For multipart or binary values,
+pass files only as bounded inline descriptor:
+`{ "filename": "report.csv", "content": "base64...", "contentType": "text/csv" }`.
+Paths and URLs are intentionally unsupported.
+
 ## Install
 
 ```bash

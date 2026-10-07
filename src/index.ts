@@ -767,12 +767,26 @@ async function getSdkMethods(
 interface ParamBinding {
   name: string;
   wireName: string;
+  /** Wire schema retained for serializer decisions and compatibility. */
+  schema?: Record<string, unknown>;
+  style?: string;
+  explode?: boolean;
+  allowReserved?: boolean;
 }
 
 interface HttpConstant {
-  location: "path" | "query" | "body";
+  location: "path" | "query" | "header" | "cookie" | "body";
   wireName: string;
   value: string | number | boolean;
+}
+
+interface RequestBodyMapping {
+  /** OpenAPI media type selected when this operation was projected. */
+  contentType?: string;
+  /** Present for body-bearing operations, including root array/text/binary bodies. */
+  required?: boolean;
+  schema?: Record<string, unknown>;
+  encoding?: Record<string, { contentType?: string; headers?: Record<string, unknown>; style?: string; explode?: boolean }>;
 }
 
 export interface HttpMapping {
@@ -780,8 +794,13 @@ export interface HttpMapping {
   path: string;
   pathParams: ParamBinding[];
   queryParams: ParamBinding[];
+  /** Declared OpenAPI `in: header` parameters. */
+  headerParams?: ParamBinding[];
+  /** Declared OpenAPI `in: cookie` parameters. */
+  cookieParams?: ParamBinding[];
   bodyParams: ParamBinding[];
   constants: HttpConstant[];
+  requestBody?: RequestBodyMapping;
 }
 
 export interface OperationTool {
@@ -942,9 +961,14 @@ export function missingRequired(
 
   const missing = requiredKeys(root).filter((key) => absent(args[key]));
 
-  const bodyArgs = (args["body"] ?? {}) as Record<string, unknown>;
-  for (const key of requiredKeys(root.properties?.["body"])) {
-    if (absent(bodyArgs[key])) missing.push(`body.${key}`);
+  // An optional root body may contain required children. Those children are
+  // required only once a caller supplies the root: validating them against an
+  // absent body made optional request bodies impossible to omit.
+  const bodyValue = args["body"];
+  if (isRecord(bodyValue)) {
+    for (const key of requiredKeys(root.properties?.["body"])) {
+      if (absent(bodyValue[key])) missing.push(`body.${key}`);
+    }
   }
   return missing;
 }
@@ -963,18 +987,392 @@ export function buildRequestBody(
   args: Record<string, unknown>,
   method: string,
 ): string | undefined {
-  const verb = method.toUpperCase();
-  if (verb === "GET" || verb === "HEAD") return undefined;
+  const request = serializeRequestBody(http, args, method);
+  return typeof request.body === "string" ? request.body : undefined;
+}
 
-  const bodyArgs = (args["body"] ?? {}) as Record<string, unknown>;
-  const bodyObj: Record<string, unknown> = {};
-  for (const b of http.bodyParams) {
-    if (bodyArgs[b.name] !== undefined) bodyObj[b.wireName] = bodyArgs[b.name];
+interface SerializedRequestBody {
+  body?: Exclude<RequestInit["body"], null>;
+  /** Deliberately absent for multipart: fetch owns its boundary. */
+  contentType?: string;
+}
+
+const MAX_INLINE_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_MULTIPART_BYTES = 10 * 1024 * 1024;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function operationBodyValue(http: HttpMapping, args: Record<string, unknown>): unknown {
+  const supplied = args["body"];
+  // Existing metadata exposes object fields separately. New metadata also carries
+  // a root schema: retain direct root arrays, text, and binary descriptors.
+  if (http.bodyParams.length === 0 && supplied !== undefined && !isRecord(supplied)) return supplied;
+  const source = isRecord(supplied) ? supplied : {};
+  // A root object with no editable bindings still has to retain its supplied
+  // fields so body constants can be applied. Root scalar/array values returned
+  // above stay untouched.
+  const value: Record<string, unknown> = http.bodyParams.length === 0 ? { ...source } : {};
+  for (const binding of http.bodyParams) {
+    if (source[binding.name] !== undefined) value[binding.wireName] = source[binding.name];
   }
-  for (const c of http.constants) {
-    if (c.location === "body") bodyObj[c.wireName] = c.value;
+  for (const constant of http.constants) {
+    if (constant.location === "body") value[constant.wireName] = constant.value;
   }
-  return JSON.stringify(bodyObj);
+  return value;
+}
+
+function isJsonMediaType(contentType: string): boolean {
+  const media = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  return media === "application/json" || media.endsWith("+json");
+}
+
+function isBase64(value: string): boolean {
+  // Do not let Buffer's permissive decoder turn an arbitrary string into bytes.
+  return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value);
+}
+
+interface InlineFile {
+  filename: string;
+  bytes: Uint8Array;
+  contentType: string;
+}
+
+/**
+ * Files are inline, bounded base64 only. Paths and URLs are intentionally not
+ * supported: an MCP caller must never cause this process to read local files or
+ * fetch an arbitrary remote URL.
+ */
+function parseInlineFile(value: unknown): InlineFile | undefined {
+  if (!isRecord(value) || typeof value["filename"] !== "string" || typeof value["content"] !== "string") {
+    return undefined;
+  }
+  const filename = value["filename"];
+  const content = value["content"];
+  const contentType = typeof value["contentType"] === "string" ? value["contentType"] : "application/octet-stream";
+  // Check encoded size before regex/Buffer allocation. Base64 expands 4:3.
+  if (content.length > Math.ceil(MAX_INLINE_FILE_BYTES / 3) * 4) {
+    throw new Error(`Inline file exceeds ${MAX_INLINE_FILE_BYTES} byte limit.`);
+  }
+  if (
+    filename.length === 0 || filename.length > 255 || /[\\/\0\r\n]/.test(filename) ||
+    contentType.length === 0 || contentType.length > 255 || /[\r\n]/.test(contentType) ||
+    !isBase64(content)
+  ) {
+    throw new Error("Invalid inline file descriptor. Use base64 content, a safe filename, and a valid contentType.");
+  }
+  const bytes = Buffer.from(content, "base64");
+  if (bytes.byteLength > MAX_INLINE_FILE_BYTES) {
+    throw new Error(`Inline file exceeds ${MAX_INLINE_FILE_BYTES} byte limit.`);
+  }
+  return { filename, bytes, contentType };
+}
+
+function appendBracketed(
+  append: (key: string, value: string, file?: InlineFile) => void,
+  key: string,
+  value: unknown,
+  bytes: { total: number },
+  allowInlineFile = false,
+): void {
+  const file = allowInlineFile ? parseInlineFile(value) : undefined;
+  if (file !== undefined) {
+    bytes.total += file.bytes.byteLength;
+    if (bytes.total > MAX_MULTIPART_BYTES) throw new Error(`Multipart body exceeds ${MAX_MULTIPART_BYTES} byte limit.`);
+    append(key, "", file);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const [index, item] of value.entries()) {
+      // Indexed object members preserve pairing in a repeated object array.
+      appendBracketed(append, isRecord(item) ? `${key}[${index}]` : `${key}[]`, item, bytes, allowInlineFile);
+    }
+    return;
+  }
+  if (isRecord(value)) {
+    for (const [nestedKey, nestedValue] of Object.entries(value)) {
+      appendBracketed(append, `${key}[${nestedKey}]`, nestedValue, bytes, allowInlineFile);
+    }
+    return;
+  }
+  if (value !== undefined && value !== null) {
+    const text = String(value);
+    bytes.total += Buffer.byteLength(text);
+    if (bytes.total > MAX_MULTIPART_BYTES) throw new Error(`Multipart body exceeds ${MAX_MULTIPART_BYTES} byte limit.`);
+    append(key, text);
+  }
+}
+
+type FormEncoding = NonNullable<RequestBodyMapping["encoding"]>[string];
+
+/**
+ * Serialize the OpenAPI `application/x-www-form-urlencoded` subset that this
+ * MCP JSON boundary can express without guessing. Explicit encoding changes
+ * the wire contract, so it must never quietly fall back to bracket notation.
+ */
+function appendUrlEncodedField(
+  form: URLSearchParams,
+  key: string,
+  value: unknown,
+  encoding: FormEncoding,
+): void {
+  if (encoding.headers !== undefined || encoding.contentType !== undefined) {
+    throw new Error(`Unsupported explicit form encoding for ${key}; form part headers/contentType require an upstream client.`);
+  }
+  const style = encoding.style ?? "form";
+  if (style !== "form") {
+    throw new Error(`Unsupported form encoding style ${style} for ${key}; use form style or configure the upstream client directly.`);
+  }
+  const explode = encoding.explode ?? true;
+  if (Array.isArray(value)) {
+    if (value.some((item) => isRecord(item) || Array.isArray(item))) {
+      throw new Error(`Unsupported nested form value for ${key}; configure the upstream client directly.`);
+    }
+    if (explode) {
+      for (const item of value) form.append(key, String(item));
+    } else {
+      form.append(key, value.map((item) => String(item)).join(","));
+    }
+    return;
+  }
+  if (isRecord(value)) {
+    const entries = Object.entries(value);
+    if (entries.some(([, item]) => isRecord(item) || Array.isArray(item) || parseInlineFile(item) !== undefined)) {
+      throw new Error(`Unsupported nested form object for ${key}; configure the upstream client directly.`);
+    }
+    if (explode) {
+      for (const [name, item] of entries) form.append(name, String(item));
+    } else {
+      form.append(key, entries.flatMap(([name, item]) => [name, String(item)]).join(","));
+    }
+    return;
+  }
+  if (value !== undefined && value !== null) form.append(key, String(value));
+}
+
+function isBinarySchema(value: unknown): boolean {
+  return isRecord(value) && value["format"] === "binary";
+}
+
+function multipartFieldSchema(http: HttpMapping, wireName: string): unknown {
+  const properties = http.requestBody?.schema?.["properties"];
+  return (isRecord(properties) ? properties[wireName] : undefined)
+    ?? http.bodyParams.find((item) => item.wireName === wireName)?.schema;
+}
+
+function hasBinarySchema(schema: unknown): boolean {
+  if (!isRecord(schema)) return false;
+  if (isBinarySchema(schema)) return true;
+  if (hasBinarySchema(schema["items"])) return true;
+  return isRecord(schema["properties"]) && Object.values(schema["properties"]).some(hasBinarySchema);
+}
+
+/** Multipart files are recognized only where the documented wire schema declares them. */
+function appendMultipartField(
+  form: FormData, key: string, value: unknown, schema: unknown,
+  partContentType: string | undefined, bytes: { total: number },
+): void {
+  const count = (size: number): void => {
+    bytes.total += size;
+    if (bytes.total > MAX_MULTIPART_BYTES) throw new Error(`Multipart body exceeds ${MAX_MULTIPART_BYTES} byte limit.`);
+  };
+  if (isBinarySchema(schema)) {
+    const file = parseInlineFile(value);
+    if (file === undefined) throw new Error(`Multipart file ${key} requires an inline file descriptor.`);
+    count(file.bytes.byteLength);
+    form.append(key, new Blob([file.bytes], { type: partContentType ?? file.contentType }), file.filename);
+    return;
+  }
+  if (partContentType !== undefined && isJsonMediaType(partContentType)) {
+    const text = JSON.stringify(value);
+    if (text !== undefined) { count(Buffer.byteLength(text)); form.append(key, new Blob([text], { type: partContentType })); }
+    return;
+  }
+  if (Array.isArray(value)) {
+    // Multipart arrays repeat the documented wire key, including existing [] spelling.
+    for (const item of value) appendMultipartField(form, key, item, isRecord(schema) ? schema["items"] : undefined, partContentType, bytes);
+    return;
+  }
+  if (isRecord(value)) {
+    if (hasBinarySchema(schema)) {
+      const properties = isRecord(schema) && isRecord(schema["properties"]) ? schema["properties"] : {};
+      for (const [name, item] of Object.entries(value)) {
+        appendMultipartField(form, `${key}[${name}]`, item, properties[name], partContentType, bytes);
+      }
+      return;
+    }
+    if (partContentType !== undefined) throw new Error(`Multipart object ${key} requires a JSON part content type.`);
+    const text = JSON.stringify(value);
+    count(Buffer.byteLength(text));
+    form.append(key, new Blob([text], { type: "application/json" }));
+    return;
+  }
+  if (value !== undefined && value !== null) {
+    const text = String(value);
+    count(Buffer.byteLength(text));
+    form.append(key, partContentType === undefined ? text : new Blob([text], { type: partContentType }));
+  }
+}
+
+/** Serialize operation body from its OpenAPI media type without filesystem or URL inputs. */
+export function serializeRequestBody(
+  http: HttpMapping,
+  args: Record<string, unknown>,
+  method: string,
+): SerializedRequestBody {
+  const verb = method.toUpperCase();
+  if (verb === "GET" || verb === "HEAD") return {};
+
+  // New metadata distinguishes an optional absent body from legacy projections.
+  // Keep legacy `undefined` on the historical JSON `{}` behavior.
+  if (http.requestBody?.required === false && args["body"] === undefined) return {};
+
+  const mediaType = http.requestBody?.contentType?.split(";", 1)[0]?.trim().toLowerCase() || "application/json";
+  const value = operationBodyValue(http, args);
+  if (isJsonMediaType(mediaType)) {
+    return { body: JSON.stringify(value), contentType: http.requestBody?.contentType ?? "application/json" };
+  }
+  if (mediaType === "application/x-www-form-urlencoded") {
+    const form = new URLSearchParams();
+    const bytes = { total: 0 };
+    if (isRecord(value)) {
+      for (const [key, field] of Object.entries(value)) {
+        const encoding = http.requestBody?.encoding?.[key];
+        if (encoding !== undefined) {
+          appendUrlEncodedField(form, key, field, encoding);
+          continue;
+        }
+        appendBracketed((name, fieldValue, file) => {
+          if (file !== undefined) throw new Error("Inline file descriptor requires multipart/form-data.");
+          form.append(name, fieldValue);
+        }, key, field, bytes);
+      }
+    }
+    return { body: form.toString(), contentType: "application/x-www-form-urlencoded" };
+  }
+  if (mediaType === "multipart/form-data") {
+    for (const [field, encoding] of Object.entries(http.requestBody?.encoding ?? {})) {
+      if (encoding.style !== undefined || encoding.explode !== undefined || encoding.headers !== undefined) {
+        throw new Error(`Unsupported explicit multipart encoding for ${field}; use default form encoding or configure the upstream client directly.`);
+      }
+    }
+    const form = new FormData();
+    const bytes = { total: 0 };
+    if (isRecord(value)) {
+      for (const [key, field] of Object.entries(value)) {
+        const configuredType = http.requestBody?.encoding?.[key]?.["contentType"];
+        const partContentType = typeof configuredType === "string" ? configuredType : undefined;
+        appendMultipartField(form, key, field, multipartFieldSchema(http, key), partContentType, bytes);
+      }
+    }
+    return { body: form };
+  }
+  if (mediaType.startsWith("text/")) {
+    if (typeof value !== "string") throw new Error(`${mediaType} requires a string body.`);
+    return { body: value, contentType: http.requestBody?.contentType ?? mediaType };
+  }
+
+  // Binary media must use the same explicit descriptor as multipart. It gives
+  // MCP JSON callers a bounded representation and prevents ambient file reads.
+  const file = parseInlineFile(value);
+  if (file === undefined) {
+    throw new Error(`${mediaType} requires an inline file descriptor: { filename, content, contentType? }.`);
+  }
+  return { body: file.bytes, contentType: http.requestBody?.contentType ?? mediaType };
+}
+
+type ParameterLocation = "query" | "header" | "cookie";
+
+function serializeParameter(value: unknown, binding: ParamBinding, location: ParameterLocation): string[] {
+  const style = binding.style ?? (location === "header" ? "simple" : "form");
+  const explode = binding.explode ?? (style === "form");
+  if (Array.isArray(value)) {
+    const delimiter = style === "spaceDelimited" ? " " : style === "pipeDelimited" ? "|" : ",";
+    return explode ? value.map((item) => String(item)) : [value.map((item) => String(item)).join(delimiter)];
+  }
+  if (isRecord(value)) {
+    const entries = Object.entries(value).map(([key, item]) => [key, String(item)] as const);
+    if (style === "deepObject") {
+      // Caller builds key names for deep-object query serialization separately.
+      return [JSON.stringify(Object.fromEntries(entries))];
+    }
+    return [explode
+      ? entries.map(([key, item]) => `${key}=${item}`).join(",")
+      : entries.flat().join(",")];
+  }
+  return [String(value)];
+}
+
+interface QueryPair { name: string; value: string; allowReserved: boolean }
+
+function appendQueryParameter(query: QueryPair[], binding: ParamBinding, value: unknown): void {
+  const style = binding.style ?? "form";
+  const explode = binding.explode ?? (style === "form");
+  const allowReserved = binding.allowReserved === true;
+  if (style === "deepObject" && isRecord(value)) {
+    for (const [key, item] of Object.entries(value)) query.push({ name: `${binding.wireName}[${key}]`, value: String(item), allowReserved });
+    return;
+  }
+  if (style === "form" && explode && isRecord(value)) {
+    for (const [key, item] of Object.entries(value)) query.push({ name: key, value: String(item), allowReserved });
+    return;
+  }
+  for (const serialized of serializeParameter(value, binding, "query")) query.push({ name: binding.wireName, value: serialized, allowReserved });
+}
+
+function encodeQueryValue(value: string, allowReserved: boolean): string {
+  const encoded = encodeURIComponent(value);
+  // `#` cannot remain literal: it would terminate the URL query. Other RFC3986
+  // reserved characters are safe inside a query value and OpenAPI allows them.
+  return allowReserved ? encoded.replace(/%3A|%2F|%3F|%40|%21|%24|%26|%27|%28|%29|%2A|%2B|%2C|%3B|%3D/gi, (part) => decodeURIComponent(part)) : encoded;
+}
+
+function operationHeaders(http: HttpMapping, args: Record<string, unknown>): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const binding of http.headerParams ?? []) {
+    const value = args[binding.name];
+    if (value !== undefined && value !== null && value !== "") {
+      headers[binding.wireName] = serializeParameter(value, binding, "header").join(",");
+    }
+  }
+  const cookies: string[] = [];
+  for (const binding of http.cookieParams ?? []) {
+    const value = args[binding.name];
+    if (value !== undefined && value !== null && value !== "") {
+      const style = binding.style ?? "form";
+      const explode = binding.explode ?? (style === "form");
+      if (style === "form" && explode && isRecord(value)) {
+        for (const [name, item] of Object.entries(value)) {
+          cookies.push(`${encodeURIComponent(name)}=${encodeURIComponent(String(item))}`);
+        }
+        continue;
+      }
+      for (const serialized of serializeParameter(value, binding, "cookie")) {
+        cookies.push(`${encodeURIComponent(binding.wireName)}=${encodeURIComponent(serialized)}`);
+      }
+    }
+  }
+  for (const constant of http.constants) {
+    if (constant.location === "header") headers[constant.wireName] = String(constant.value);
+    if (constant.location === "cookie") cookies.push(`${encodeURIComponent(constant.wireName)}=${encodeURIComponent(String(constant.value))}`);
+  }
+  if (cookies.length > 0) headers["Cookie"] = cookies.join("; ");
+  return headers;
+}
+
+function isSlackSemanticError(url: URL, responseText: string): boolean {
+  // Slack uses 200 with { ok:false, error } as its documented application
+  // failure envelope. Scope detection to Slack's own origin; another provider's
+  // unrelated `ok:false` payload remains valid response data.
+  const host = url.hostname.toLowerCase();
+  if (host !== "slack.com" && !host.endsWith(".slack.com")) return false;
+  try {
+    const payload = JSON.parse(responseText) as { ok?: unknown; error?: unknown };
+    return payload.ok === false && typeof payload.error === "string" && payload.error !== "";
+  } catch {
+    return false;
+  }
 }
 
 /** Build + perform the real API call for one operation tool, return a text result. */
@@ -1003,17 +1401,22 @@ async function executeOperation(
   const method = http.method.toUpperCase();
   const path = fillPath(http, args);
 
-  const query = new URLSearchParams();
+  const query: QueryPair[] = [];
   for (const q of http.queryParams) {
     const v = args[q.name];
-    if (v !== undefined && v !== null && v !== "") query.set(q.wireName, String(v));
+    if (v !== undefined && v !== null && v !== "") appendQueryParameter(query, q, v);
   }
   for (const c of http.constants) {
-    if (c.location === "query") query.set(c.wireName, String(c.value));
+    if (c.location === "query") query.push({ name: c.wireName, value: String(c.value), allowReserved: false });
   }
-  const qs = query.toString();
+  const qs = query.map((pair) => `${encodeURIComponent(pair.name)}=${encodeQueryValue(pair.value, pair.allowReserved)}`).join("&");
 
-  const body = buildRequestBody(http, args, method);
+  let requestBody: SerializedRequestBody;
+  try {
+    requestBody = serializeRequestBody(http, args, method);
+  } catch (err) {
+    return { ok: false, text: `Error: ${err instanceof Error ? err.message : String(err)}` };
+  }
 
   let url: URL;
   try {
@@ -1022,16 +1425,17 @@ async function executeOperation(
     return { ok: false, text: `Error: ${err instanceof Error ? err.message : String(err)}` };
   }
 
+  const headers = new Headers(operationHeaders(http, args));
+  if (!headers.has("Accept")) headers.set("Accept", "application/json");
+  if (requestBody.contentType !== undefined) headers.set("Content-Type", requestBody.contentType);
+  // Headers normalise names case-insensitively, so an operation parameter cannot
+  // smuggle a second Authorization/Content-Type around the credential policy.
+  for (const [name, value] of Object.entries(authHeaders(meta.auth))) headers.set(name, value);
+
   const res = await fetch(url, {
     method,
-    headers: {
-      // Only claimed when a body is actually sent, so a GET does not advertise
-      // a payload it does not have.
-      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-      Accept: "application/json",
-      ...authHeaders(meta.auth),
-    },
-    ...(body !== undefined ? { body } : {}),
+    headers,
+    ...(requestBody.body !== undefined ? { body: requestBody.body } : {}),
     signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS),
   });
 
@@ -1041,7 +1445,7 @@ async function executeOperation(
   const text = await readCapped(res, MAX_RESPONSE_BYTES).catch(() => "");
   const status = `${res.status}${res.statusText !== "" ? ` ${res.statusText}` : ""}`;
   return {
-    ok: res.ok,
+    ok: res.ok && !isSlackSemanticError(url, text),
     text: `${method} ${url} → ${status}\n\n${text !== "" ? text : "(empty response body)"}`,
   };
 }
