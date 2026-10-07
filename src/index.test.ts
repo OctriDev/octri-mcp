@@ -190,13 +190,50 @@ describe("persisted operation media serializers", () => {
     assert.equal(form.get("compact"), "R,100,G,200");
   });
 
+  it("serializes Stripe deepObject fields with scalars, nested objects, and arrays", () => {
+    // POST /v1/customers marks each of these as { style: "deepObject", explode: true }.
+    const encoded = serializeRequestBody(
+      {
+        ...base,
+        requestBody: {
+          contentType: "application/x-www-form-urlencoded",
+          encoding: {
+            business_name: { style: "deepObject", explode: true },
+            cash_balance: { style: "deepObject", explode: true },
+            invoice_settings: { style: "deepObject", explode: true },
+            preferred_locales: { style: "deepObject", explode: true },
+            tax_id_data: { style: "deepObject", explode: true },
+          },
+        },
+      },
+      {
+        body: {
+          business_name: "Octri",
+          cash_balance: { settings: { reconciliation_mode: "manual" } },
+          invoice_settings: { custom_fields: [{ name: "PO", value: "42" }] },
+          preferred_locales: ["en", "fr"],
+          tax_id_data: [{ type: "eu_vat", value: "EU123" }],
+        },
+      },
+      "POST",
+    );
+    const form = new URLSearchParams(encoded.body as string);
+    assert.equal(form.get("business_name"), "Octri");
+    assert.equal(form.get("cash_balance[settings][reconciliation_mode]"), "manual");
+    assert.equal(form.get("invoice_settings[custom_fields][0][name]"), "PO");
+    assert.equal(form.get("invoice_settings[custom_fields][0][value]"), "42");
+    assert.deepEqual(form.getAll("preferred_locales[]"), ["en", "fr"]);
+    assert.equal(form.get("tax_id_data[0][type]"), "eu_vat");
+    assert.equal(form.get("tax_id_data[0][value]"), "EU123");
+  });
+
   it("refuses urlencoded directives this MCP boundary cannot serialize", () => {
     const configured = (encoding: Record<string, unknown>) => serializeRequestBody(
       { ...base, requestBody: { contentType: "application/x-www-form-urlencoded", encoding: { field: encoding } } },
       { body: { field: "value" } },
       "POST",
     );
-    assert.throws(() => configured({ style: "deepObject" }), /Unsupported form encoding style/);
+    assert.throws(() => configured({ style: "deepObject", explode: false }), /deepObject requires explode:true/);
     assert.throws(() => configured({ headers: { "X-Part": { schema: { type: "string" } } } }), /form part headers/);
   });
 

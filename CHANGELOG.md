@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.2
+
+- Explicit `application/x-www-form-urlencoded` `deepObject` fields with
+  `explode: true` now serialize as bracketed keys. Stripe customer fields such
+  as `invoice_settings`, `cash_balance`, `preferred_locales`, and `tax_id_data`
+  now reach documented endpoint, including nested objects and arrays.
+  Unsupported `deepObject` `explode: false`, form part headers/content types,
+  and other styles still fail before any upstream request.
+
 ## 1.2.1
 
 - Operation tools retain documented request media, parameter locations, and

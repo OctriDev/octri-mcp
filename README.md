@@ -19,6 +19,10 @@ pass files only as bounded inline descriptor:
 `{ "filename": "report.csv", "content": "base64...", "contentType": "text/csv" }`.
 Paths and URLs are intentionally unsupported.
 
+Explicit URL-encoded `deepObject` fields with `explode: true` use bracketed
+wire keys, including nested objects and arrays. This covers APIs such as Stripe
+that mark fields like `invoice_settings` and `tax_id_data` as `deepObject`.
+
 ## Install
 
 ```bash

@@ -52,6 +52,26 @@ for (const mode of ["stdio", "http", "sse"] as const) {
     const forms = { bodyParams: [{ name: "accountName", wireName: "account_name" }, { name: "items", wireName: "line_items" }], constants: [{ location: "body" as const, wireName: "kind", value: "fixture" }] };
     const tools = [
       tool("form", { ...forms, requestBody: { contentType: "application/x-www-form-urlencoded" } }),
+      tool("stripeCustomer", {
+        path: "/v1/customers",
+        bodyParams: [
+          { name: "businessName", wireName: "business_name" },
+          { name: "cashBalance", wireName: "cash_balance" },
+          { name: "invoiceSettings", wireName: "invoice_settings" },
+          { name: "preferredLocales", wireName: "preferred_locales" },
+          { name: "taxIdData", wireName: "tax_id_data" },
+        ],
+        requestBody: {
+          contentType: "application/x-www-form-urlencoded",
+          encoding: {
+            business_name: { style: "deepObject", explode: true },
+            cash_balance: { style: "deepObject", explode: true },
+            invoice_settings: { style: "deepObject", explode: true },
+            preferred_locales: { style: "deepObject", explode: true },
+            tax_id_data: { style: "deepObject", explode: true },
+          },
+        },
+      }),
       tool("multipart", { bodyParams: [{ name: "file", wireName: "file" }], requestBody: { contentType: "multipart/form-data", schema: { type: "object", properties: { file: { type: "string", format: "binary" } } } } }),
       tool("multipartNested", { requestBody: { contentType: "multipart/form-data", schema: { type: "object", properties: { "files[]": { type: "array", items: { type: "string", format: "binary" } }, nested: { type: "object", properties: { file: { type: "string", format: "binary" } } }, metadata: { type: "object" } } } } }),
       tool("patch", { method: "PATCH", requestBody: { contentType: "application/json-patch+json", schema: { type: "array" } } }),
@@ -109,6 +129,24 @@ for (const mode of ["stdio", "http", "sse"] as const) {
       const form = new URLSearchParams(last().body.toString());
       assert.equal(form.get("account_name"), "nested"); assert.equal(form.get("kind"), "fixture");
       assert.equal(form.get("line_items[0][price_id]"), "p1"); assert.equal(form.get("line_items[1][quantity]"), "3");
+      assert.notEqual((await call("stripeCustomer", {
+        body: {
+          businessName: "Octri", cashBalance: { settings: { reconciliation_mode: "manual" } },
+          invoiceSettings: { custom_fields: [{ name: "PO", value: "42" }] },
+          preferredLocales: ["en", "fr"], taxIdData: [{ type: "eu_vat", value: "EU123" }],
+        },
+      })).isError, true);
+      assert.equal(last().path, "/v1/customers");
+      assert.equal(last().headers["content-type"], "application/x-www-form-urlencoded");
+      assert.equal(last().headers.authorization, "Bearer receiver-token");
+      const stripeForm = new URLSearchParams(last().body.toString());
+      assert.equal(stripeForm.get("business_name"), "Octri");
+      assert.equal(stripeForm.get("cash_balance[settings][reconciliation_mode]"), "manual");
+      assert.equal(stripeForm.get("invoice_settings[custom_fields][0][name]"), "PO");
+      assert.equal(stripeForm.get("invoice_settings[custom_fields][0][value]"), "42");
+      assert.deepEqual(stripeForm.getAll("preferred_locales[]"), ["en", "fr"]);
+      assert.equal(stripeForm.get("tax_id_data[0][type]"), "eu_vat");
+      assert.equal(stripeForm.get("tax_id_data[0][value]"), "EU123");
       assert.notEqual((await call("multipart", { body: { file: { filename: "input.wav", content: "UklGRg==", contentType: "audio/wav" } } })).isError, true);
       assert.match(last().headers["content-type"] ?? "", /^multipart\/form-data; boundary=/);
       assert.ok(last().body.includes(Buffer.from("RIFF"))); assert.match(last().body.toString(), /filename="input.wav"/);

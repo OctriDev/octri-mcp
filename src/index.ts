@@ -1116,11 +1116,24 @@ function appendUrlEncodedField(
   key: string,
   value: unknown,
   encoding: FormEncoding,
+  bytes: { total: number },
 ): void {
   if (encoding.headers !== undefined || encoding.contentType !== undefined) {
     throw new Error(`Unsupported explicit form encoding for ${key}; form part headers/contentType require an upstream client.`);
   }
   const style = encoding.style ?? "form";
+  if (style === "deepObject") {
+    // Stripe and other providers explicitly use deepObject for form fields.
+    // Its wire format is the bracket notation handled by this bounded helper.
+    if (encoding.explode !== true) {
+      throw new Error(`Unsupported deepObject encoding for ${key}; deepObject requires explode:true.`);
+    }
+    appendBracketed((name, fieldValue, file) => {
+      if (file !== undefined) throw new Error("Inline file descriptor requires multipart/form-data.");
+      form.append(name, fieldValue);
+    }, key, value, bytes);
+    return;
+  }
   if (style !== "form") {
     throw new Error(`Unsupported form encoding style ${style} for ${key}; use form style or configure the upstream client directly.`);
   }
@@ -1240,7 +1253,7 @@ export function serializeRequestBody(
       for (const [key, field] of Object.entries(value)) {
         const encoding = http.requestBody?.encoding?.[key];
         if (encoding !== undefined) {
-          appendUrlEncodedField(form, key, field, encoding);
+          appendUrlEncodedField(form, key, field, encoding, bytes);
           continue;
         }
         appendBracketed((name, fieldValue, file) => {
