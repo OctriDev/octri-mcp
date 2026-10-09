@@ -112,7 +112,7 @@ Add to `.vscode/mcp.json`:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `OCTRI_PROJECT_ID` | Yes* | None | The project to connect to. Can also be set via `--project-id` CLI flag. |
-| `OCTRI_API_URL` | No | `https://api.octri.dev/api/v1` | Override the API base URL (useful for self-hosted deployments). |
+| `OCTRI_API_URL` | No | `https://api.octri.dev/api/v1` | Override the API base URL for local development or an authorized private test endpoint. Hosted Octri self-hosting is not available. |
 | `MCP_TRANSPORT` | No | `stdio` | `http` for remote hosting (Streamable HTTP), or `sse` for the legacy transport. |
 | `PORT` | No | `3000` | HTTP port for the `http` and `sse` transports. |
 | `MCP_HOST` | No | `127.0.0.1` | Interface to bind. Widening it requires `MCP_AUTH_TOKEN`. |
