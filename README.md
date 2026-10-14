@@ -231,8 +231,8 @@ Requires an npm account with access to the `@octri` scope.
 [Swift](https://github.com/octridev/octri-swift) ·
 [Dart](https://github.com/octridev/octri-dart)
 
-[Documentation](https://docs.octri.dev/docs) ·
+[Documentation](https://octri.dev/developers) ·
 [Pricing](https://octri.dev/pricing) ·
-[Changelog](https://docs.octri.dev/changelog)
+[Changelog](https://octri.dev/developers/changelog)
 
 MIT licensed.
