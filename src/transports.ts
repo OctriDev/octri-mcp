@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -175,6 +175,23 @@ export async function startStdio(makeServer: ServerFactory): Promise<void> {
 
 // ─── Streamable HTTP transport (current spec, for remote hosting) ─────────────
 
+/** A session nobody has used for this long is closed. */
+export const HTTP_SESSION_IDLE_MS = 30 * 60_000;
+/** Open sessions per process. A new one past this is refused until one closes. */
+export const MAX_HTTP_SESSIONS = 256;
+
+interface HttpSession {
+  server: Server;
+  transport: StreamableHTTPServerTransport;
+  lastSeen: number;
+}
+
+/** A JSON-RPC error, the shape an MCP client reads off a refused request. */
+function rpcError(res: http.ServerResponse, status: number, message: string): void {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message }, id: null }));
+}
+
 /**
  * Serves MCP over Streamable HTTP on a single `/mcp` endpoint.
  *
@@ -183,15 +200,39 @@ export async function startStdio(makeServer: ServerFactory): Promise<void> {
  * and is kept only so existing deployments keep working. New hosting should use
  * this one, which is what a current client tries first.
  *
- * Stateless: every request gets its own server and transport, so nothing is
- * pinned to a session id and any number of replicas can sit behind a load
- * balancer without sharing state.
+ * Stateful: a client's initialize opens a session (its id comes back in the
+ * `mcp-session-id` header), and every later request carrying that id reaches
+ * the same server. It has to: an "ask first" tool sends the client an approval
+ * prompt in the middle of a call, and the answer arrives on a second request.
+ * Stateless, that request reached a fresh server that never asked, and the call
+ * sat out its approval timeout before being refused. Behind several replicas,
+ * route by `mcp-session-id` (sticky sessions).
  */
 export async function startStreamableHttp(
   config: TransportConfig,
   makeServer: ServerFactory,
   label: string = DEFAULT_LABEL,
 ): Promise<void> {
+  const sessions = new Map<string, HttpSession>();
+
+  const closeSession = async (id: string): Promise<void> => {
+    const session = sessions.get(id);
+    if (session === undefined) return;
+    // Out of the map first: closing the transport calls back into onclose.
+    sessions.delete(id);
+    await session.transport.close().catch(() => undefined);
+    await session.server.close().catch(() => undefined);
+  };
+
+  const sweep = async (now: number = Date.now()): Promise<void> => {
+    const idle = [...sessions.entries()]
+      .filter(([, session]) => now - session.lastSeen > HTTP_SESSION_IDLE_MS)
+      .map(([id]) => id);
+    await Promise.all(idle.map(closeSession));
+  };
+  // A pending sweep must never keep a stopped server alive.
+  setInterval(() => void sweep(), 60_000).unref();
+
   const httpServer = http.createServer((req, res) => {
     const refusal = httpRequestRefusal(req.headers, config);
     if (refusal !== null) {
@@ -207,22 +248,43 @@ export async function startStreamableHttp(
       return;
     }
 
-    // Stateless mode answers a whole request/response cycle per POST. A GET or
-    // DELETE only means anything for a session this mode never opens.
-    if (req.method !== "POST") {
-      res.writeHead(405, { "Content-Type": "application/json", Allow: "POST" });
-      res.end(JSON.stringify({ error: "Method not allowed. This endpoint is stateless; use POST." }));
-      return;
-    }
-
     void (async (): Promise<void> => {
-      const server = makeServer();
-      const transport = new StreamableHTTPServerTransport({});
-      res.on("close", () => {
-        void transport.close();
-        void server.close();
-      });
       try {
+        const header = req.headers["mcp-session-id"];
+        if (typeof header === "string" && header !== "") {
+          const session = sessions.get(header);
+          // 404 is the spec's signal to start a new session, which clients do.
+          if (session === undefined) {
+            rpcError(res, 404, "Session not found or expired. Start a new one.");
+            return;
+          }
+          session.lastSeen = Date.now();
+          // GET opens the session's event stream, DELETE ends the session,
+          // POST carries a message: the transport tells them apart.
+          await session.transport.handleRequest(req, res);
+          return;
+        }
+
+        if (req.method !== "POST") {
+          rpcError(res, 400, "No session. Send an initialize request first.");
+          return;
+        }
+        if (sessions.size >= MAX_HTTP_SESSIONS) await sweep();
+        if (sessions.size >= MAX_HTTP_SESSIONS) {
+          rpcError(res, 503, "Too many open sessions. Try again shortly.");
+          return;
+        }
+
+        const server = makeServer();
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (id) => {
+            sessions.set(id, { server, transport, lastSeen: Date.now() });
+          },
+        });
+        transport.onclose = () => {
+          if (transport.sessionId !== undefined) void closeSession(transport.sessionId);
+        };
         // The SDK declares this transport's `onclose` as `(() => void) | undefined`
         // while the Transport interface it implements declares `onclose?: () => void`.
         // Those describe the same thing, but `exactOptionalPropertyTypes` treats
@@ -230,6 +292,9 @@ export async function startStreamableHttp(
         // it is narrowed here rather than worked around in the code around it.
         await server.connect(transport as Transport);
         await transport.handleRequest(req, res);
+        // Not an initialize request: the transport refused it, no session was
+        // opened, and nothing will ever reach this server again.
+        if (transport.sessionId === undefined) await server.close();
       } catch (err: unknown) {
         process.stderr.write(`Streamable HTTP error: ${String(err)}\n`);
         if (!res.headersSent) {
@@ -246,6 +311,6 @@ export async function startStreamableHttp(
 
   process.stderr.write(
     `${label} (Streamable HTTP) listening on http://${config.host}:${config.port}\n` +
-      `  MCP endpoint: POST /mcp\n`,
+      `  MCP endpoint: POST /mcp (sessions: route by the mcp-session-id header)\n`,
   );
 }

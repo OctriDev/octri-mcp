@@ -9,6 +9,10 @@
  *     owner's SDK Studio config (names, doc comments, inclusion, deprecation).
  *     These PERFORM the real API call, using credentials from the env below.
  *
+ * Commands:
+ *   octri-mcp [--project-id <id>]    serve (stdio unless MCP_TRANSPORT says otherwise)
+ *   octri-mcp doctor [--no-call]     check the setup end to end and say what to fix
+ *
  * Env:
  *   OCTRI_PROJECT_ID / --project-id   the project to expose
  *   OCTRI_API_URL                     the Octri API (defaults to prod)
@@ -43,7 +47,8 @@
  * Transports:
  *   stdio (default)   for Claude Desktop / Cursor local integrations
  *   http              Streamable HTTP for remote hosting (MCP_TRANSPORT=http).
- *                     The transport the current spec defines: POST /mcp.
+ *                     The transport the current spec defines: /mcp, one
+ *                     session per client (route replicas by mcp-session-id).
  *   sse               legacy HTTP+SSE (MCP_TRANSPORT=sse), superseded in spec
  *                     revision 2025-03-26 and kept for existing deployments.
  *                     New hosting should use `http`.
@@ -61,6 +66,7 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 import { loadConfig } from "./config.js";
+import { formatDoctor, runDoctor } from "./doctor.js";
 import { processEnv } from "./env.js";
 import { createServer } from "./server.js";
 import { httpStartupRefusal, startSse, startStdio, startStreamableHttp } from "./transports.js";
@@ -73,7 +79,21 @@ export * from "./core.js";
 
 async function main(): Promise<void> {
   const env = processEnv();
-  const config = loadConfig(process.argv.slice(2), env);
+  const args = process.argv.slice(2);
+  const config = loadConfig(args, env);
+
+  // `octri-mcp doctor`: check the setup, print what to fix, exit.
+  if (args[0] === "doctor") {
+    const checks = await runDoctor({
+      source: { kind: "live", apiUrl: config.apiUrl, projectId: config.projectId },
+      env,
+      permissions: config.permissions,
+      telemetry: config.telemetry,
+      call: !args.includes("--no-call"),
+    });
+    process.stdout.write(formatDoctor(checks));
+    process.exit(checks.some((c) => c.status === "fail") ? 1 : 0);
+  }
 
   if (["http", "streamable-http", "sse"].includes(config.transport)) {
     const refusal = httpStartupRefusal(config);

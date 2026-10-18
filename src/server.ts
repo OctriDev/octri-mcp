@@ -33,6 +33,12 @@ export type ToolManifest = McpToolsResponse;
 export interface OctriProject {
   apiUrl: string;
   projectId: string;
+  /**
+   * Serve the documentation tools. Default true. A project whose docs sit
+   * behind a sign-in gate turns them off: the server carries no reader token,
+   * so every docs call would fail, while usage reporting still works.
+   */
+  docs?: boolean;
 }
 
 /**
@@ -65,6 +71,11 @@ export interface CreateServerOptions {
   permissions?: UserPermissions;
   /** Counts each tool call for the owner. Default: nothing is reported. */
   reporter?: UsageReporter;
+  /**
+   * Sends operation calls. Default: global fetch. A host that runs the server
+   * on its own infrastructure passes one that refuses private addresses.
+   */
+  fetch?: typeof fetch;
 }
 
 function textResult(text: string, isError = false) {
@@ -79,8 +90,9 @@ export function createServer(options: CreateServerOptions): Server {
   const home: OctriProject | undefined =
     source.kind === "live" ? { apiUrl: source.apiUrl, projectId: source.projectId } : source.octri;
   // Documentation tools read an Octri project; a static build without one has none.
-  const docsTools: Tool[] = home !== undefined ? TOOLS : [];
-  const servesDocs = (name: string) => home !== undefined && isDocsTool(name);
+  const withDocs = home !== undefined && home.docs !== false;
+  const docsTools: Tool[] = withDocs ? TOOLS : [];
+  const servesDocs = (name: string) => withDocs && isDocsTool(name);
 
   const loadOperations = (projectId: string): Promise<ToolManifest> =>
     source.kind === "static"
@@ -189,7 +201,7 @@ export function createServer(options: CreateServerOptions): Server {
             },
             env.prefix,
           );
-          const result = await executeOperation(tool, data, a, gate, env);
+          const result = await executeOperation(tool, data, a, gate, env, options.fetch);
           report(result.held ?? (result.ok ? "ok" : "error"));
           return textResult(result.text, !result.ok);
         }

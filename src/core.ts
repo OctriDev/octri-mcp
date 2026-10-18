@@ -57,3 +57,4 @@ export {
 } from "./operations.js";
 export { processUsageReporter, UsageReporter, type CallEvent, type CallOutcome } from "./usage.js";
 export { formatChangelog, isDocsTool, runDocsTool } from "./docs-tools.js";
+export { formatDoctor, runDoctor, type DoctorCheck, type DoctorOptions } from "./doctor.js";

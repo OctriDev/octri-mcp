@@ -680,6 +680,7 @@ export async function executeOperation(
   args: Record<string, unknown>,
   gate?: SendGate,
   env: EnvSource = processEnv(),
+  fetchImpl: typeof fetch = fetch,
 ): Promise<OperationResult> {
   const baseUrl = (readEnv(env, "API_BASE_URL") ?? meta.baseUrl ?? "").replace(/\/+$/, "");
   if (baseUrl === "") {
@@ -745,7 +746,7 @@ export async function executeOperation(
     if (held !== null) return held;
   }
 
-  const res = await fetch(url, {
+  const res = await fetchImpl(url, {
     method,
     headers,
     ...(requestBody.body !== undefined ? { body: requestBody.body } : {}),

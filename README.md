@@ -181,8 +181,12 @@ docker run -p 3000:3000 \
   octri-mcp
 ```
 
-It serves a single endpoint, `POST /mcp`, and runs statelessly, so requests
-carry no session and any number of replicas can sit behind a load balancer.
+It serves a single endpoint, `/mcp`. A client's first request opens a session
+and gets its id back in the `mcp-session-id` header; every later request
+carries it and reaches the same server. That is what lets a tool that asks
+first work: the approval prompt goes out in the middle of a call and the
+answer comes back on another request. Sessions idle for 30 minutes are closed.
+Behind more than one replica, route by `mcp-session-id` (sticky sessions).
 Point a remote MCP client at `http://your-host:3000/mcp`.
 
 ### Legacy HTTP+SSE transport
@@ -203,6 +207,18 @@ Widening `MCP_HOST` puts those credentials on the network, so the server then
 refuses to start without `MCP_AUTH_TOKEN`, and every request must send
 `Authorization: Bearer <token>`. Configure the same header in your MCP client,
 and list browser origins explicitly.
+
+---
+
+## Check your setup
+
+```bash
+npx -y @octri/mcp doctor --project-id YOUR_PROJECT_ID
+```
+
+Confirms the project and its tools load, the base URL and credentials are set,
+and makes one real read call, then says what to fix if anything fails.
+`--no-call` skips the call. Exits non-zero on a failure.
 
 ---
 

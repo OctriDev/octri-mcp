@@ -22,6 +22,19 @@
   tool source (the Octri API) or a static manifest, a server name, and an env
   prefix, so a host can serve the same tools under its own name and variables.
   The `octri-mcp` command, its flags and its env vars are unchanged.
+- `octri-mcp doctor` checks a setup end to end (project, tools, base URL,
+  credentials, one real read call) and says what to fix. `--no-call` skips the
+  call. Exits non-zero on a failure, so it also runs in CI.
+- Streamable HTTP (`MCP_TRANSPORT=http`) now keeps a session per client
+  (`mcp-session-id`), so an "ask first" tool can be approved over HTTP: the
+  answer to its prompt arrives on a later request and now reaches the server
+  that asked. Previously every request got a fresh server, and such a call
+  waited out its approval timeout. Idle sessions close after 30 minutes. Behind
+  several replicas, route by `mcp-session-id`.
+- `createServer` takes a `fetch` for operation calls, so a host can route them
+  through its own network policy.
+- `zod` is now a declared dependency. It was already a required peer of the
+  MCP SDK; declaring it lets workspace consumers link this package.
 
 ## 1.2.2
 
