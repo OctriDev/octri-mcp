@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.3.0
+
+- Tool permissions. Each operation tool carries the policy its project owner
+  published: run on its own, ask first, or off. An "ask first" call is built,
+  shown to the user through MCP elicitation (method, URL, a short body excerpt)
+  and sent only on approval. A client without elicitation gets a refusal, not
+  an unapproved call. Payloads without a policy get the same default: reads run,
+  everything else asks.
+- End-user limits: `OCTRI_READ_ONLY` / `--read-only`, `OCTRI_DENY_TOOLS` /
+  `--deny-tools`, and `OCTRI_ALLOW_TOOLS` / `--allow-tools` or
+  `OCTRI_ALLOW_WRITES` / `--allow-writes` to pre-approve "ask first" tools. None
+  of them can bring back a tool the owner turned off.
+- `OCTRI_DRY_RUN` / `--dry-run` builds each API call and returns it unsent.
+- Every non-read operation tool now reports `destructiveHint: true` unless the
+  owner marks it as only adding data. Previously only DELETE did.
+- Each tool call reports its tool name, outcome, duration and client name (never
+  arguments or responses) so owners see per-tool agent usage. Turn it off with
+  `OCTRI_TELEMETRY=0` or `--no-telemetry`.
+- The server is now a library as well as a command: `createServer` takes a live
+  tool source (the Octri API) or a static manifest, a server name, and an env
+  prefix, so a host can serve the same tools under its own name and variables.
+  The `octri-mcp` command, its flags and its env vars are unchanged.
+
 ## 1.2.2
 
 - Explicit `application/x-www-form-urlencoded` `deepObject` fields with

@@ -7,11 +7,19 @@ import { pathToFileURL } from "node:url";
 
 import {
   buildRequestBody,
+  canAskForApproval,
   formatChangelog,
   isDirectRun,
+  loadUserPermissions,
   missingRequired,
+  needsApproval,
   operationAnnotations,
+  previewBody,
+  sendGate,
   serializeRequestBody,
+  toolPolicy,
+  UsageReporter,
+  userAllowsTool,
   type HttpMapping,
 } from "./index.js";
 
@@ -347,10 +355,130 @@ describe("operation tool annotations", () => {
     assert.equal(a?.idempotentHint, true);
   });
 
-  it("marks POST neither read-only nor idempotent", () => {
+  // Changed deliberately with tool permissions: a non-read is destructive unless
+  // the owner says it only adds (the MCP spec's default). Reporting every POST
+  // and PUT as harmless told clients they could run them unattended.
+  it("marks POST destructive by default, and neither read-only nor idempotent", () => {
     const a = operationAnnotations("POST");
     assert.equal(a?.readOnlyHint, false);
-    assert.equal(a?.destructiveHint, false);
+    assert.equal(a?.destructiveHint, true);
     assert.equal(a?.idempotentHint, false);
+  });
+
+  it("takes the owner's word that a write only adds, but never makes a read destructive", () => {
+    assert.equal(operationAnnotations("POST", false)?.destructiveHint, false);
+    assert.equal(operationAnnotations("GET", true)?.destructiveHint, false);
+  });
+});
+
+describe("tool permissions", () => {
+  const post = { name: "createPet", http: { method: "POST" } };
+  const get = { name: "listPets", http: { method: "GET" } };
+  const none = loadUserPermissions([], {});
+
+  it("defaults a payload with no policy to the API's own defaults", () => {
+    assert.equal(toolPolicy(get), "auto");
+    assert.equal(toolPolicy(post), "confirm");
+    assert.equal(toolPolicy({ ...post, policy: "auto" }), "auto");
+  });
+
+  it("lets the user narrow, and pre-approve, but never revive an `off` tool", () => {
+    const readOnly = loadUserPermissions(["--read-only"], {});
+    assert.equal(userAllowsTool(post, readOnly), false);
+    assert.equal(userAllowsTool(get, readOnly), true);
+    assert.equal(userAllowsTool(get, loadUserPermissions([], { OCTRI_DENY_TOOLS: "listPets, other" })), false);
+
+    const allowAll = loadUserPermissions([], { OCTRI_ALLOW_WRITES: "1" });
+    assert.equal(needsApproval(post, none), true);
+    assert.equal(needsApproval(post, allowAll), false);
+    assert.equal(needsApproval(post, loadUserPermissions(["--allow-tools", "createPet"], {})), false);
+    assert.equal(userAllowsTool({ ...post, policy: "off" }, allowAll), false);
+  });
+
+  it("reads elicitation support the way both old and new clients advertise it", () => {
+    assert.equal(canAskForApproval(undefined), false);
+    assert.equal(canAskForApproval({}), false);
+    assert.equal(canAskForApproval({ elicitation: {} }), true);
+    assert.equal(canAskForApproval({ elicitation: { form: {} } }), true);
+    assert.equal(canAskForApproval({ elicitation: { url: {} } }), false);
+  });
+});
+
+describe("send gate", () => {
+  const tool = {
+    slug: "create-pet", name: "createPet", description: "", deprecated: false,
+    inputSchema: { type: "object" as const },
+    http: { method: "POST", path: "/pets", pathParams: [], queryParams: [], bodyParams: [], constants: [] },
+  };
+  const request = { method: "POST", url: "https://api.example.com/pets", body: '{"name":"Rex"}' };
+  const client = (answer: "accept" | "decline" | "cancel", asked: string[] = []) => ({
+    capabilities: () => ({ elicitation: {} }),
+    ask: async (message: string) => { asked.push(message); return answer; },
+  });
+
+  it("sends an approved call and shows the user the exact request", async () => {
+    const asked: string[] = [];
+    assert.equal(await sendGate(tool, loadUserPermissions([], {}), client("accept", asked))(request), null);
+    assert.match(asked[0] ?? "", /POST https:\/\/api\.example\.com\/pets/);
+    assert.match(asked[0] ?? "", /"name":"Rex"/);
+  });
+
+  it("holds a declined or cancelled call", async () => {
+    for (const answer of ["decline", "cancel"] as const) {
+      const held = await sendGate(tool, loadUserPermissions([], {}), client(answer))(request);
+      assert.equal(held?.held, "declined");
+      assert.equal(held?.ok, false);
+    }
+  });
+
+  it("refuses rather than runs when the client cannot ask", async () => {
+    const held = await sendGate(tool, loadUserPermissions([], {}), {
+      capabilities: () => ({}),
+      ask: async () => { throw new Error("must not ask"); },
+    })(request);
+    assert.equal(held?.held, "blocked");
+    assert.match(held?.text ?? "", /OCTRI_ALLOW_TOOLS=createPet/);
+  });
+
+  it("returns a dry run unsent, before any approval prompt", async () => {
+    const held = await sendGate(tool, loadUserPermissions(["--dry-run"], {}), {
+      capabilities: () => ({}),
+      ask: async () => { throw new Error("must not ask"); },
+    })(request);
+    assert.equal(held?.held, "dry_run");
+    assert.equal(held?.ok, true);
+    assert.match(held?.text ?? "", /not sent/);
+  });
+
+  it("summarises bodies without dumping them", () => {
+    assert.equal(previewBody(undefined), undefined);
+    assert.equal(previewBody(new URLSearchParams({ a: "1" })), "a=1");
+    const form = new FormData();
+    form.append("file", "x");
+    form.append("file", "y");
+    assert.equal(previewBody(form), "multipart form: file");
+    assert.equal(previewBody("x".repeat(700))?.length, 601);
+  });
+});
+
+describe("usage reporter", () => {
+  it("batches per project, splits at the API's limit, and swallows failures", async () => {
+    const sent: { url: string; count: number }[] = [];
+    const reporter = new UsageReporter("https://api.test/api/v1", async (url, body) => {
+      sent.push({ url, count: (JSON.parse(body) as { events: unknown[] }).events.length });
+      throw new Error("offline");
+    });
+    const event = { tool: "listPets", outcome: "ok" as const, durationMs: 3, at: new Date().toISOString() };
+    for (let i = 0; i < 19; i += 1) reporter.record("p1", event);
+    reporter.record("p2", event);
+    await reporter.flush();
+    assert.deepEqual(sent, [
+      { url: "https://api.test/api/v1/public/mcp/p1/events", count: 19 },
+      { url: "https://api.test/api/v1/public/mcp/p2/events", count: 1 },
+    ]);
+
+    sent.length = 0;
+    await reporter.flush();
+    assert.deepEqual(sent, [], "an empty queue sends nothing");
   });
 });

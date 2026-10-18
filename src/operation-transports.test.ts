@@ -5,6 +5,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import http, { type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -29,9 +30,11 @@ async function stop(child: ChildProcess | undefined): Promise<void> {
   await Promise.race([once(child, "exit"), delay(2000)]);
   if (child.exitCode === null) child.kill("SIGKILL");
 }
-function tool(name: string, mapping: Partial<HttpMapping>, required: string[] = []): OperationTool {
+// Published as "auto": this suite is about what reaches the wire, and every
+// fixture tool is a POST, which would otherwise ask first (see "guarded").
+function tool(name: string, mapping: Partial<HttpMapping>, required: string[] = [], policy: OperationTool["policy"] = "auto"): OperationTool {
   return {
-    name, slug: name, description: name, deprecated: false,
+    name, slug: name, description: name, deprecated: false, policy,
     inputSchema: { type: "object", properties: {}, required },
     http: { method: "POST", path: `/${name}`, pathParams: [], queryParams: [], bodyParams: [], constants: [], ...mapping },
   };
@@ -81,6 +84,7 @@ for (const mode of ["stdio", "http", "sse"] as const) {
       tool("headers", { method: "GET", headerParams: [{ name: "beta", wireName: "OpenAI-Beta" }, { name: "accept", wireName: "Accept" }, { name: "spoof", wireName: "authorization" }], cookieParams: [{ name: "session", wireName: "session_id" }, { name: "cookieObject", wireName: "ignored" }], queryParams: [{ name: "tags", wireName: "tags" }, { name: "pipe", wireName: "ids", style: "pipeDelimited" }], constants: [{ location: "header", wireName: "Idempotency-Key", value: "fixed" }, { location: "cookie", wireName: "tenant", value: "fixture" }] }, ["beta"]),
       tool("optional", { requestBody: { contentType: "application/json", required: false, schema: { type: "object", required: ["name"] } } }),
       tool("semantic", { method: "GET" }),
+      tool("guarded", {}, [], "confirm"),
     ];
     const metadata = http.createServer((req, res) => {
       const slack = req.url?.includes("slack-fixture") === true;
@@ -95,21 +99,24 @@ for (const mode of ["stdio", "http", "sse"] as const) {
     await writeFile(preload, `const realFetch=globalThis.fetch; globalThis.fetch=(input,options)=>{const url=new URL(String(input)); return realFetch(url.hostname==='slack.com' ? ${JSON.stringify(receiver)}+url.pathname+url.search : input,options)};`);
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined && !/^(OCTRI_|MCP_|PORT$)/.test(entry[0])));
     Object.assign(env, { OCTRI_PROJECT_ID: "fixture", OCTRI_API_URL: `http://127.0.0.1:${apiPort}`, OCTRI_API_TOKEN: "receiver-token", MCP_TRANSPORT: mode });
-    const entry = new URL("./index.js", import.meta.url).pathname;
+    // File paths, not URL pathnames: "/D:/..." is no path on Windows, and a bare
+    // "D:\..." handed to --import reads as a URL with scheme "d:".
+    const entry = fileURLToPath(new URL("./index.js", import.meta.url));
+    const preloadUrl = pathToFileURL(preload).href;
     let child: ChildProcess | undefined;
     let stdoutBytes = 0;
     let stderr = "";
     const c = new Client({ name: "transport-regression", version: "1" }, { capabilities: {} });
     try {
       if (mode === "stdio") {
-        const transport = new StdioClientTransport({ command: process.execPath, args: ["--import", preload, entry], env, stderr: "pipe" });
+        const transport = new StdioClientTransport({ command: process.execPath, args: ["--import", preloadUrl, entry], env, stderr: "pipe" });
         transport.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
         await c.connect(transport);
       } else {
         const reservation = http.createServer();
         const port = await listen(reservation);
         await new Promise<void>((resolve) => reservation.close(() => resolve()));
-        child = spawn(process.execPath, ["--import", preload, entry], { env: { ...env, PORT: String(port) }, stdio: ["ignore", "pipe", "pipe"] });
+        child = spawn(process.execPath, ["--import", preloadUrl, entry], { env: { ...env, PORT: String(port) }, stdio: ["ignore", "pipe", "pipe"] });
         child.stdout?.on("data", (chunk: Buffer) => { stdoutBytes += chunk.length; });
         child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
         for (let attempt = 0; attempt < 100 && !stderr.includes("listening"); attempt += 1) {
@@ -175,6 +182,12 @@ for (const mode of ["stdio", "http", "sse"] as const) {
       assert.equal(new URL(last().path, receiver).searchParams.get("ids"), "a|b");
       assert.notEqual((await call("optional")).isError, true); assert.equal(last().body.length, 0); assert.equal(last().headers["content-type"], undefined);
       assert.notEqual((await call("semantic")).isError, true, "Arbitrary ok:false response is valid data");
+      // An "ask first" tool on a client that cannot ask is refused, not sent.
+      before = captures.length;
+      const guarded = await call("guarded", {});
+      assert.equal(guarded.isError, true);
+      assert.match(JSON.stringify(guarded.content), /cannot ask for it/);
+      assert.equal(captures.length, before);
       assert.equal((await call("semantic", { projectId: "slack-fixture" })).isError, true, "Slack documented envelope is an error");
       before = captures.length;
       for (const file of ["/etc/passwd", "https://example.invalid/file", { filename: "../secret", content: "AA==" }, { filename: "big", content: "A".repeat(14_000_000) }]) {

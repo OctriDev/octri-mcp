@@ -138,6 +138,32 @@ not served by them: those are ordinary body fields, so they appear as tool
 arguments and the agent passes them like any other field. Setting
 `OCTRI_API_KEY` for such an API adds a header it ignores.
 
+### Permissions
+
+The project owner sets every operation tool to run on its own, ask first, or
+off, and publishes that from the MCP page. Reads run on their own by default and
+everything else asks first. An "ask first" call is shown to the user through MCP
+elicitation (Claude Code 2.1.76+, VS Code) with its method, URL and body, and is
+sent only on approval. A client that cannot ask is refused the call instead.
+
+These narrow what the owner allowed. Only `ALLOW` widens anything, and nothing
+brings back a tool the owner turned off:
+
+| Variable | Flag | Effect |
+|----------|------|--------|
+| `OCTRI_READ_ONLY=1` | `--read-only` | List and run only tools that read. |
+| `OCTRI_DENY_TOOLS=a,b` | `--deny-tools a,b` | Never list or run these tools. |
+| `OCTRI_ALLOW_TOOLS=a,b` | `--allow-tools a,b` | Run these "ask first" tools without asking (`*` for all). |
+| `OCTRI_ALLOW_WRITES=1` | `--allow-writes` | Same as `OCTRI_ALLOW_TOOLS=*`. |
+| `OCTRI_DRY_RUN=1` | `--dry-run` | Build each call and return it to the agent unsent. |
+
+### Usage reporting
+
+Each tool call reports its tool name, outcome, duration and the client's name to
+Octri, so the project owner can see which tools agents use. Arguments and
+responses are never sent. Set `OCTRI_TELEMETRY=0` or pass `--no-telemetry` to
+turn it off.
+
 ---
 
 ## Remote hosting
@@ -195,6 +221,29 @@ MCP_TRANSPORT=http OCTRI_PROJECT_ID=my-project node dist/index.js
 # Run in the legacy SSE mode
 MCP_TRANSPORT=sse OCTRI_PROJECT_ID=my-project node dist/index.js
 ```
+
+### As a library
+
+The `octri-mcp` command is one host for the server core. `createServer` takes
+the tool source and everything else a host decides:
+
+```ts
+import { createServer, startStdio, processEnv, loadUserPermissions } from "@octri/mcp";
+
+const env = processEnv("ACME"); // reads ACME_API_TOKEN, ACME_ALLOW_TOOLS, ...
+await startStdio(() =>
+  createServer({
+    // "live" fetches tools from the Octri API; "static" serves a fixed manifest.
+    source: { kind: "static", manifest },
+    branding: { name: "acme-mcp", version: "2.4.0" },
+    env,
+    permissions: loadUserPermissions(process.argv.slice(2), env),
+  }),
+);
+```
+
+A static source serves Octri's documentation tools, and reports usage, only
+when it is given an Octri project (`octri: { apiUrl, projectId }`).
 
 ---
 
