@@ -1,6 +1,7 @@
 import { type UserPermissions } from "./config.js";
 import { envName, readEnv, type EnvSource } from "./env.js";
 import { executeOperation, fetchOperationTools, type McpToolsResponse, type OperationTool } from "./operations.js";
+import { narrowToGroup } from "./groups.js";
 import { isReadMethod, toolPolicy, userAllowsTool } from "./permissions.js";
 
 import type { ToolSource } from "./server.js";
@@ -27,6 +28,12 @@ export interface DoctorOptions {
   telemetry: boolean;
   /** Make one real read call. Default true; `--no-call` turns it off. */
   call?: boolean;
+  /** Where the credential came from: the env, the system keychain (`login`), or nowhere. */
+  credentialSource?: "env" | "keychain" | "none";
+  /** The tool group the server is set to serve. */
+  group?: string;
+  /** Practice mode: nothing is sent, so base URL, credentials and the test call do not apply. */
+  practice?: boolean;
   fetch?: typeof fetch;
 }
 
@@ -64,7 +71,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorCheck[]> 
     }
     add("pass", "Project", source.projectId);
     try {
-      manifest = await fetchOperationTools(source.apiUrl, source.projectId);
+      manifest = await fetchOperationTools(source.apiUrl, source.projectId, options.practice === true ? { practice: true } : {});
       add("pass", "Octri API", `${source.apiUrl} answered`);
     } catch (err) {
       add(
@@ -80,7 +87,18 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorCheck[]> 
     add("pass", "Tools", "built into this package");
   }
 
-  // 2. What an agent will see.
+  // 2. The tool group, when one is set: the rest checks only its tools.
+  if (options.group !== undefined) {
+    try {
+      manifest = narrowToGroup(manifest, options.group);
+      add("pass", "Tool group", `${options.group}: ${manifest.tools.length} tools`);
+    } catch (err) {
+      add("fail", "Tool group", `${err instanceof Error ? err.message : String(err)} Check --group / ${envName(env, "GROUP")}.`);
+      return checks;
+    }
+  }
+
+  // 3. What an agent will see.
   const visible = manifest.tools.filter((t) => userAllowsTool(t, permissions));
   const asks = visible.filter((t) => toolPolicy(t) === "confirm").length;
   if (visible.length === 0) {
@@ -99,7 +117,18 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorCheck[]> 
     );
   }
 
-  // 3. Where calls go.
+  // In practice mode nothing is sent: what matters is whether there is anything to answer from.
+  if (options.practice === true) {
+    const answered = Object.keys(manifest.practice ?? {}).length;
+    if (manifest.practice === undefined) {
+      add("fail", "Practice mode", "The project's owner has not turned practice mode on, so every call would be refused.");
+    } else {
+      add("pass", "Practice mode", `${answered} ${answered === 1 ? "operation answers" : "operations answer"} with fake data. Nothing is sent and no credential is needed.`);
+    }
+    return checks;
+  }
+
+  // 4. Where calls go.
   const baseUrl = (readEnv(env, "API_BASE_URL") ?? manifest.baseUrl ?? "").replace(/\/+$/, "");
   if (baseUrl === "") {
     add("fail", "Base URL", `None set. Set ${envName(env, "API_BASE_URL")}.`);
@@ -109,18 +138,20 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorCheck[]> 
     add("pass", "Base URL", `${baseUrl}${readEnv(env, "API_BASE_URL") !== undefined ? " (from your environment)" : ""}`);
   }
 
-  // 4. Credentials for the scheme the API uses.
+  // 5. Credentials for the scheme the API uses.
   const needed = credentialSuffixes(manifest.auth);
   const missing = needed.filter((suffix) => (readEnv(env, suffix) ?? "") === "");
   if (needed.length === 0) {
     add("info", "Credentials", `The API declares no auth scheme (${manifest.auth}).`);
   } else if (missing.length > 0) {
-    add("fail", "Credentials", `${manifest.auth} auth: set ${missing.map((s) => envName(env, s)).join(" and ")}.`);
+    add("fail", "Credentials", `${manifest.auth} auth: set ${missing.map((s) => envName(env, s)).join(" and ")}, or run login to keep it in the system keychain.`);
+  } else if (options.credentialSource === "keychain") {
+    add("pass", "Credentials", `${manifest.auth} auth: from the system keychain (login)`);
   } else {
     add("pass", "Credentials", `${manifest.auth} auth: ${needed.map((s) => envName(env, s)).join(", ")} set`);
   }
 
-  // 5. One real read, when everything above allows it.
+  // 6. One real read, when everything above allows it.
   const blocked = checks.some((c) => c.status === "fail");
   if (options.call === false) {
     add("info", "Test call", "Skipped (--no-call).");

@@ -133,6 +133,71 @@ describe("Streamable HTTP sessions", () => {
     await client.close();
   });
 
+  it("sends the approval prompt on the tool call's own stream, for a client with no GET stream", async () => {
+    // A bare HTTP client: it never opens the standalone GET stream the SDK
+    // client opens for itself. The prompt used to go out on that stream, so a
+    // client like this one waited on it until the approval timed out.
+    const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+    const init = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: { elicitation: {} }, clientInfo: { name: "bare", version: "1" } },
+      }),
+    });
+    const session = init.headers.get("mcp-session-id") ?? "";
+    await init.text();
+    const inSession = { ...headers, "mcp-session-id": session };
+    await fetch(endpoint, {
+      method: "POST",
+      headers: inSession,
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    });
+
+    const call = await fetch(endpoint, {
+      method: "POST",
+      headers: inSession,
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "deletePet", arguments: {} } }),
+    });
+    assert.ok(call.body !== null);
+    const reader = call.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = "";
+    let prompt: { id: number | string; method: string } | undefined;
+    let result: { id: number; result?: { isError?: boolean } } | undefined;
+    while (result === undefined) {
+      const chunk = await Promise.race([reader.read(), delay(5000).then(() => undefined)]);
+      assert.ok(chunk !== undefined, "the tool call's stream went quiet before the prompt or the result");
+      if (chunk.done) break;
+      buffered += decoder.decode(chunk.value, { stream: true });
+      let end: number;
+      while ((end = buffered.indexOf("\n\n")) >= 0) {
+        const data = buffered.slice(0, end).split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5)).join("");
+        buffered = buffered.slice(end + 2);
+        if (data === "") continue;
+        const message = JSON.parse(data) as { id?: number | string; method?: string; result?: { isError?: boolean } };
+        if (message.method === "elicitation/create" && message.id !== undefined) {
+          prompt = { id: message.id, method: message.method };
+          await fetch(endpoint, {
+            method: "POST",
+            headers: inSession,
+            body: JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { action: "accept", content: {} } }),
+          });
+        } else if (message.id === 2) {
+          result = message as { id: number; result?: { isError?: boolean } };
+        }
+      }
+    }
+    await reader.cancel();
+    assert.equal(prompt?.method, "elicitation/create");
+    assert.notEqual(result?.result?.isError, true, JSON.stringify(result));
+    assert.equal(hits.at(-1), "DELETE /deletePet");
+    await fetch(endpoint, { method: "DELETE", headers: inSession });
+  });
+
   it("routes a session's requests to its server, and forgets it once ended", async () => {
     const { client, transport } = await connect();
     const id = transport.sessionId;
@@ -147,6 +212,22 @@ describe("Streamable HTTP sessions", () => {
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
     });
     assert.equal(ended.status, 404);
+  });
+
+  it("answers a health check, and keeps the host check on it", async () => {
+    const health = await fetch(endpoint.replace(/\/mcp$/, "/health"));
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { status: "ok" });
+    const rebound = await new Promise<number>((resolve, reject) => {
+      const url = new URL(endpoint.replace(/\/mcp$/, "/health"));
+      http
+        .get({ host: url.hostname, port: url.port, path: url.pathname, headers: { host: "attacker.test" } }, (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        })
+        .on("error", reject);
+    });
+    assert.equal(rebound, 403);
   });
 
   it("asks for an initialize before anything else", async () => {

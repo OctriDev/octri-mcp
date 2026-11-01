@@ -83,11 +83,27 @@ describe("doctor", () => {
     assert.deepEqual(byName(checks, "Credentials"), {
       status: "fail",
       name: "Credentials",
-      detail: "bearer auth: set ACME_API_TOKEN.",
+      // The fix names both ways to supply it: the env var, or login and the system keychain.
+      detail: "bearer auth: set ACME_API_TOKEN, or run login to keep it in the system keychain.",
     });
     assert.equal(byName(checks, "Test call")?.status, "info");
     assert.equal(seen.length, before);
     assert.match(formatDoctor(checks), /1 check failed\./);
+  });
+
+  it("in practice mode, checks only that there is practice data, and sends nothing", async () => {
+    const before = seen.length;
+    const off = await runDoctor(options({}, { practice: true }));
+    assert.equal(byName(off, "Practice mode")?.status, "fail");
+    assert.equal(byName(off, "Credentials"), undefined, "no credential is needed");
+    const on = await runDoctor(options({}, { practice: true, source: { kind: "static", manifest: { ...manifest, practice: { listPets: { status: 200 } } } } }));
+    assert.deepEqual(byName(on, "Practice mode"), {
+      status: "pass",
+      name: "Practice mode",
+      detail: "1 operation answers with fake data. Nothing is sent and no credential is needed.",
+    });
+    assert.equal(on.filter((c) => c.status === "fail").length, 0);
+    assert.equal(seen.length, before);
   });
 
   it("blames the credentials when the API refuses them", async () => {

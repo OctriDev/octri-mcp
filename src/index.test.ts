@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -16,6 +16,7 @@ import {
   operationAnnotations,
   previewBody,
   sendGate,
+  serializeWholeQuery,
   serializeRequestBody,
   toolPolicy,
   UsageReporter,
@@ -62,10 +63,18 @@ describe("entry point detection", () => {
   it("treats a symlinked entry point as a direct run", () => {
     const dir = mkdtempSync(join(tmpdir(), "octri-mcp-entry-"));
     try {
-      const real = join(realpathSync(dir), "server.js");
+      const pkg = join(realpathSync(dir), "pkg");
+      mkdirSync(pkg);
+      const real = join(pkg, "server.js");
       writeFileSync(real, "// server\n");
-      const shim = join(realpathSync(dir), "bin-shim.js");
-      symlinkSync(real, shim);
+      // The package directory reached through a link, as pnpm installs it. A
+      // directory link rather than a file one: Windows refuses file symlinks
+      // without admin rights or Developer Mode (EPERM), but a junction needs
+      // neither, and either way argv[1] differs from the resolved module path.
+      // "junction" is ignored outside Windows, where this is a plain symlink.
+      const linked = join(realpathSync(dir), "linked");
+      symlinkSync(pkg, linked, "junction");
+      const shim = join(linked, "server.js");
 
       const moduleUrl = pathToFileURL(real).href;
 
@@ -127,6 +136,15 @@ describe("request body construction", () => {
     assert.equal(buildRequestBody(http, {}, "HEAD"), undefined);
   });
 
+  it("uses body rules for exact method tokens", () => {
+    assert.deepEqual(JSON.parse(buildRequestBody(http, { body: { accessToken: "t" } }, "get") ?? "null"), {
+      access_token: "t",
+    });
+    assert.deepEqual(JSON.parse(buildRequestBody(http, { body: { accessToken: "t" } }, "QUERY") ?? "null"), {
+      access_token: "t",
+    });
+  });
+
   it("maps supplied fields onto their wire names", () => {
     const body = buildRequestBody(http, { body: { accessToken: "tok", startDate: "2026-01-01" } }, "POST");
     assert.deepEqual(JSON.parse(body ?? "null"), {
@@ -155,6 +173,58 @@ describe("request body construction", () => {
       name: "Ada",
       kind: "fixture",
     });
+  });
+
+  it("sends only bound fields and constants for a strict body, whatever the agent adds", () => {
+    // The owner hid start_date and pinned client_id: the agent may still send both.
+    const strict: HttpMapping = {
+      ...http,
+      bodyParams: [{ name: "accessToken", wireName: "access_token" }],
+      constants: [{ location: "body", wireName: "client_id", value: "abc" }],
+      strictBody: true,
+    };
+    const args = { body: { accessToken: "t", startDate: "2026-01-01", start_date: "x", client_id: "evil" } };
+    assert.deepEqual(JSON.parse(buildRequestBody(strict, args, "POST") ?? "null"), {
+      access_token: "t",
+      client_id: "abc",
+    });
+
+    // Every field hidden or pinned: the raw body is still not forwarded.
+    const allPinned: HttpMapping = { ...strict, bodyParams: [] };
+    assert.deepEqual(JSON.parse(buildRequestBody(allPinned, args, "POST") ?? "null"), { client_id: "abc" });
+    assert.deepEqual(JSON.parse(buildRequestBody(allPinned, { body: "raw text" }, "POST") ?? "null"), {
+      client_id: "abc",
+    });
+  });
+});
+
+describe("OpenAPI 3.2 whole-query serialization", () => {
+  it("encodes compact JSON without a parameter name", () => {
+    assert.equal(
+      serializeWholeQuery({ tags: ["red", "blue"], archived: false }, { "application/json": {} }),
+      "%7B%22tags%22%3A%5B%22red%22%2C%22blue%22%5D%2C%22archived%22%3Afalse%7D",
+    );
+  });
+
+  it("serializes form arrays and objects by their documented form encoding", () => {
+    assert.equal(
+      serializeWholeQuery(
+        { tags: ["red", "blue"], filter: { region: "eu", active: true } },
+        { "application/x-www-form-urlencoded": { encoding: { filter: { style: "deepObject", explode: true } } } },
+      ),
+      "tags=red&tags=blue&filter%5Bregion%5D=eu&filter%5Bactive%5D=true",
+    );
+  });
+
+  it("rejects ambiguous or unsupported whole-query media before a request is built", () => {
+    assert.throws(
+      () => serializeWholeQuery({ tag: "red" }, { "application/json": {}, "application/x-www-form-urlencoded": {} }),
+      /exactly one content media type/i,
+    );
+    assert.throws(
+      () => serializeWholeQuery({ tag: "red" }, { "text/plain": {} }),
+      /Unsupported querystring media type/i,
+    );
   });
 });
 
@@ -348,11 +418,19 @@ describe("operation tool annotations", () => {
     });
   });
 
-  it("marks DELETE destructive but idempotent", () => {
-    const a = operationAnnotations("delete");
+  it("marks exact DELETE destructive but idempotent", () => {
+    const a = operationAnnotations("DELETE");
     assert.equal(a?.readOnlyHint, false);
     assert.equal(a?.destructiveHint, true);
     assert.equal(a?.idempotentHint, true);
+  });
+
+  it("does not give custom case variants standard-method hints", () => {
+    const a = operationAnnotations("delete");
+    assert.equal(a?.readOnlyHint, false);
+    assert.equal(a?.destructiveHint, true);
+    assert.equal(a?.idempotentHint, false);
+    assert.equal(operationAnnotations("get")?.readOnlyHint, false);
   });
 
   // Changed deliberately with tool permissions: a non-read is destructive unless
@@ -382,6 +460,16 @@ describe("tool permissions", () => {
     assert.equal(toolPolicy({ ...post, policy: "auto" }), "auto");
   });
 
+  it("requires approval for custom case variants and excludes them in read-only mode", () => {
+    const readOnly = loadUserPermissions(["--read-only"], {});
+    for (const method of ["get", "head", "options", "QUERY"]) {
+      const tool = { name: "customOperation", http: { method } };
+      assert.equal(toolPolicy(tool), "confirm");
+      assert.equal(needsApproval(tool, none), true);
+      assert.equal(userAllowsTool(tool, readOnly), false);
+    }
+  });
+
   it("lets the user narrow, and pre-approve, but never revive an `off` tool", () => {
     const readOnly = loadUserPermissions(["--read-only"], {});
     assert.equal(userAllowsTool(post, readOnly), false);
@@ -393,6 +481,20 @@ describe("tool permissions", () => {
     assert.equal(needsApproval(post, allowAll), false);
     assert.equal(needsApproval(post, loadUserPermissions(["--allow-tools", "createPet"], {})), false);
     assert.equal(userAllowsTool({ ...post, policy: "off" }, allowAll), false);
+  });
+
+  it("keeps a deny list written before the owner renamed a tool, and asks again on an old allow", () => {
+    // The owner renamed createPet (slug post-pets) to add_pet on the MCP page.
+    const renamed = { ...post, name: "add_pet", originalName: "createPet", slug: "post-pets" };
+    for (const deny of ["add_pet", "createPet", "post-pets"]) {
+      assert.equal(userAllowsTool(renamed, loadUserPermissions(["--deny-tools", deny], {})), false, deny);
+    }
+    assert.equal(userAllowsTool(renamed, loadUserPermissions(["--deny-tools", "other"], {})), true);
+
+    assert.equal(needsApproval(renamed, loadUserPermissions(["--allow-tools", "add_pet"], {})), false);
+    assert.equal(needsApproval(renamed, loadUserPermissions(["--allow-tools", "post-pets"], {})), false);
+    // The old name no longer pre-approves: the call asks, which is the safe way to fail.
+    assert.equal(needsApproval(renamed, loadUserPermissions(["--allow-tools", "createPet"], {})), true);
   });
 
   it("reads elicitation support the way both old and new clients advertise it", () => {

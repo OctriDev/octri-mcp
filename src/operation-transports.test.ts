@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import http, { type Server } from "node:http";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -17,12 +18,57 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 
 import type { HttpMapping, OperationTool } from "./index.js";
 
-async function listen(server: Server): Promise<number> {
+async function listen(server: Server | net.Server): Promise<number> {
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const address = server.address();
   assert.ok(address && typeof address !== "string");
   return address.port;
+}
+
+/**
+ * Node's HTTP server rejects some valid custom lower-case methods before an
+ * application handler can observe them. This loopback peer records raw HTTP so
+ * the transport contract covers the method bytes Fetch actually sends.
+ */
+function rawUpstream(captures: { method: string; path: string; headers: http.IncomingHttpHeaders; body: Buffer }[]): net.Server {
+  return net.createServer((socket) => {
+    let received = Buffer.alloc(0);
+    socket.on("data", (chunk: Buffer) => {
+      received = Buffer.concat([received, chunk]);
+      const headerEnd = received.indexOf("\r\n\r\n");
+      if (headerEnd === -1) return;
+
+      const headerText = received.subarray(0, headerEnd).toString("latin1");
+      const [requestLine, ...headerLines] = headerText.split("\r\n");
+      const [method, path] = requestLine?.split(" ", 3) ?? [];
+      if (method === undefined || path === undefined) {
+        socket.destroy();
+        return;
+      }
+
+      const headers: http.IncomingHttpHeaders = {};
+      for (const line of headerLines) {
+        const separator = line.indexOf(":");
+        if (separator < 1) continue;
+        const name = line.slice(0, separator).toLowerCase();
+        const value = line.slice(separator + 1).trim();
+        const existing = headers[name];
+        headers[name] = typeof existing === "string" ? `${existing}, ${value}` : value;
+      }
+      const contentLength = Number(headers["content-length"] ?? 0);
+      if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+        socket.destroy();
+        return;
+      }
+      const bodyStart = headerEnd + 4;
+      if (received.length < bodyStart + contentLength) return;
+
+      captures.push({ method, path, headers, body: received.subarray(bodyStart, bodyStart + contentLength) });
+      const responseBody = Buffer.from(path.startsWith("/semantic") ? '{"ok":false,"error":"not_authed"}' : '{"accepted":true}');
+      socket.end(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${responseBody.length}\r\nConnection: close\r\n\r\n${responseBody.toString("utf8")}`);
+    });
+  });
 }
 async function stop(child: ChildProcess | undefined): Promise<void> {
   if (child === undefined || child.exitCode !== null) return;
@@ -40,16 +86,21 @@ function tool(name: string, mapping: Partial<HttpMapping>, required: string[] = 
   };
 }
 
+function resultText(result: unknown): string {
+  if (typeof result !== "object" || result === null || !("content" in result)) return "";
+  const content = result.content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((item): item is { type: "text"; text: string } =>
+      typeof item === "object" && item !== null && item.type === "text" && typeof item.text === "string")
+    .map((item) => item.text)
+    .join("\n");
+}
+
 for (const mode of ["stdio", "http", "sse"] as const) {
   test(`official Client ${mode}: wire bodies, headers, cookies, auth, refusals, semantic errors`, { timeout: 60_000 }, async () => {
-    const captures: { path: string; headers: http.IncomingHttpHeaders; body: Buffer }[] = [];
-    const upstream = http.createServer(async (req, res) => {
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) chunks.push(Buffer.from(chunk as Uint8Array));
-      captures.push({ path: req.url ?? "", headers: req.headers, body: Buffer.concat(chunks) });
-      res.setHeader("content-type", "application/json");
-      res.end(req.url?.startsWith("/semantic") === true ? '{"ok":false,"error":"not_authed"}' : '{"accepted":true}');
-    });
+    const captures: { method: string; path: string; headers: http.IncomingHttpHeaders; body: Buffer }[] = [];
+    const upstream = rawUpstream(captures);
     const upstreamPort = await listen(upstream);
     const receiver = `http://127.0.0.1:${upstreamPort}`;
     const forms = { bodyParams: [{ name: "accountName", wireName: "account_name" }, { name: "items", wireName: "line_items" }], constants: [{ location: "body" as const, wireName: "kind", value: "fixture" }] };
@@ -82,6 +133,43 @@ for (const mode of ["stdio", "http", "sse"] as const) {
       tool("text", { requestBody: { contentType: "text/plain", schema: { type: "string" } } }),
       tool("binary", { requestBody: { contentType: "application/octet-stream", schema: { type: "string", format: "binary" } } }),
       tool("headers", { method: "GET", headerParams: [{ name: "beta", wireName: "OpenAI-Beta" }, { name: "accept", wireName: "Accept" }, { name: "spoof", wireName: "authorization" }], cookieParams: [{ name: "session", wireName: "session_id" }, { name: "cookieObject", wireName: "ignored" }], queryParams: [{ name: "tags", wireName: "tags" }, { name: "pipe", wireName: "ids", style: "pipeDelimited" }], constants: [{ location: "header", wireName: "Idempotency-Key", value: "fixed" }, { location: "cookie", wireName: "tenant", value: "fixture" }] }, ["beta"]),
+      tool("wholeJson", {
+        method: "GET",
+        querystring: { name: "filters", content: { "application/json": { schema: { type: "object" } } } },
+      }),
+      tool("wholeForm", {
+        method: "copy",
+        querystring: {
+          name: "filters",
+          content: {
+            "application/x-www-form-urlencoded": {
+              encoding: { tags: { style: "form", explode: true } },
+            },
+          },
+        },
+      }),
+      tool("wholeConflict", {
+        method: "GET",
+        queryParams: [{ name: "page", wireName: "page" }],
+        querystring: { name: "filters", content: { "application/json": {} } },
+      }),
+      tool("wholeUnsupported", {
+        method: "GET",
+        querystring: { name: "filters", content: { "text/plain": {} } },
+      }),
+      tool("upperCopy", { method: "COPY" }),
+      tool("lowerCopy", { method: "copy" }),
+      tool("queryWithBody", { method: "QUERY" }),
+      tool("lowerGet", { method: "get" }),
+      tool("lowerDelete", { method: "delete" }),
+      tool("lowerHead", { method: "head" }),
+      tool("lowerOptions", { method: "options" }),
+      tool("lowerPost", { method: "post" }),
+      tool("lowerPut", { method: "put" }),
+      tool("trace", { method: "TRACE" }),
+      tool("connect", { method: "CONNECT" }),
+      tool("track", { method: "TRACK" }),
+      tool("invalidMethod", { method: "GET\n" }),
       tool("optional", { requestBody: { contentType: "application/json", required: false, schema: { type: "object", required: ["name"] } } }),
       tool("semantic", { method: "GET" }),
       tool("guarded", {}, [], "confirm"),
@@ -180,6 +268,53 @@ for (const mode of ["stdio", "http", "sse"] as const) {
       assert.match(last().headers.cookie ?? "", /tenant=fixture/);
       assert.deepEqual(new URL(last().path, receiver).searchParams.getAll("tags"), ["one", "two"]);
       assert.equal(new URL(last().path, receiver).searchParams.get("ids"), "a|b");
+      assert.notEqual((await call("wholeJson", { filters: { tags: ["red", "blue"], includeArchived: false } })).isError, true);
+      assert.equal(last().path, "/wholeJson?%7B%22tags%22%3A%5B%22red%22%2C%22blue%22%5D%2C%22includeArchived%22%3Afalse%7D");
+      assert.notEqual((await call("wholeForm", { filters: { tags: ["red", "blue"], region: "eu" } })).isError, true);
+      assert.equal(last().method, "copy");
+      assert.equal(last().path, "/wholeForm?tags=red&tags=blue&region=eu");
+      before = captures.length;
+      const rejectedWholeQueries: ReadonlyArray<readonly [string, RegExp]> = [
+        ["wholeConflict", /cannot combine.*whole query/i],
+        ["wholeUnsupported", /Unsupported querystring media type/i],
+      ];
+      for (const [name, expectedError] of rejectedWholeQueries) {
+        const result = await call(name, { filters: { tag: "no-io" } });
+        assert.equal(result.isError, true);
+        assert.match(resultText(result), expectedError);
+        assert.equal(captures.length, before);
+      }
+      const upperCopy = await call("upperCopy", { body: { copied: "upper" } });
+      assert.notEqual(upperCopy.isError, true);
+      assert.equal(last().method, "COPY");
+      assert.equal(last().body.toString(), '{"copied":"upper"}');
+      const lowerCopy = await call("lowerCopy", { body: { copied: "lower" } });
+      assert.notEqual(lowerCopy.isError, true);
+      assert.equal(last().method, "copy");
+      assert.equal(last().body.toString(), '{"copied":"lower"}');
+      assert.match(resultText(lowerCopy), /^copy http:/);
+      assert.notEqual((await call("queryWithBody", { body: { queried: true } })).isError, true);
+      assert.equal(last().method, "QUERY");
+      assert.equal(last().body.toString(), '{"queried":true}');
+      before = captures.length;
+      const rejectedMethods: ReadonlyArray<readonly [string, RegExp]> = [
+        ["lowerGet", /Fetch would normalize it to GET/],
+        ["lowerDelete", /Fetch would normalize it to DELETE/],
+        ["lowerHead", /Fetch would normalize it to HEAD/],
+        ["lowerOptions", /Fetch would normalize it to OPTIONS/],
+        ["lowerPost", /Fetch would normalize it to POST/],
+        ["lowerPut", /Fetch would normalize it to PUT/],
+        ["trace", /Fetch forbids TRACE/],
+        ["connect", /Fetch forbids CONNECT/],
+        ["track", /Fetch forbids TRACK/],
+        ["invalidMethod", /Invalid HTTP method token/],
+      ];
+      for (const [rejectedMethod, expectedError] of rejectedMethods) {
+        const result = await call(rejectedMethod, { body: { mustNotSend: true } });
+        assert.equal(result.isError, true);
+        assert.match(resultText(result), expectedError);
+        assert.equal(captures.length, before);
+      }
       assert.notEqual((await call("optional")).isError, true); assert.equal(last().body.length, 0); assert.equal(last().headers["content-type"], undefined);
       assert.notEqual((await call("semantic")).isError, true, "Arbitrary ok:false response is valid data");
       // An "ask first" tool on a client that cannot ask is refused, not sent.
@@ -196,6 +331,14 @@ for (const mode of ["stdio", "http", "sse"] as const) {
         // prove no upstream request was made and keep the process test alive.
         if (typeof file === "object" && file.content.length > 1_000_000 && mode !== "http") {
           await assert.rejects(call("binary", { body: file }));
+          assert.equal(captures.length, before);
+          break;
+        }
+        // Streamable HTTP refuses it at the transport too from SDK 1.32 (4 MB
+        // request body cap); before that the tool refuses it. Either is fine.
+        if (typeof file === "object" && file.content.length > 1_000_000) {
+          const refused = await call("binary", { body: file }).catch(() => null);
+          if (refused !== null) assert.equal(refused.isError, true);
           assert.equal(captures.length, before);
           break;
         }

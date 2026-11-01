@@ -1,10 +1,18 @@
+import type { AuditEvent } from "./limits.js";
+
 // ─── Usage reporting ───────────────────────────────────────────────────────────
 
 /** Mirrors `McpCallOutcome` in @octri/shared. */
-export type CallOutcome = "ok" | "error" | "declined" | "blocked" | "dry_run";
+export type CallOutcome = "ok" | "error" | "declined" | "blocked" | "dry_run" | "outage" | "practice" | "limited";
 
 export interface CallEvent {
   tool: string;
+  /** The endpoint slug of an operation tool, so a rename keeps its history. */
+  slug?: string;
+  /** The tool group the server was serving, so the owner sees use per group. */
+  group?: string;
+  /** Set on a request a chained tool sent: that tool's slug. */
+  chain?: string;
   outcome: CallOutcome;
   durationMs: number;
   client?: string;
@@ -23,9 +31,13 @@ const REPORT_TIMEOUT_MS = 5_000;
  * them per tool for the owner's MCP page. Best effort by design: a report that
  * fails is dropped, never retried and never surfaced, because a usage counter
  * must not be able to slow down or break a tool call.
+ *
+ * Audit entries (every write an agent attempted, when the owner keeps an
+ * audit log) ride the same batching to their own route.
  */
 export class UsageReporter {
   private readonly queues = new Map<string, CallEvent[]>();
+  private readonly auditQueues = new Map<string, AuditEvent[]>();
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
@@ -37,20 +49,35 @@ export class UsageReporter {
         body,
         signal: AbortSignal.timeout(REPORT_TIMEOUT_MS),
       }),
+    /**
+     * How long a quiet queue waits before it is sent. The default spares a
+     * self-hosted server a request per call; a host that writes the events
+     * itself can afford a short wait, so its live feed keeps up with the calls.
+     */
+    private readonly intervalMs: number = REPORT_INTERVAL_MS,
   ) {}
 
   record(projectId: string, event: CallEvent): void {
-    const queue = this.queues.get(projectId) ?? [];
+    this.enqueue(this.queues, projectId, event);
+  }
+
+  audit(projectId: string, event: AuditEvent): void {
+    this.enqueue(this.auditQueues, projectId, event);
+  }
+
+  private enqueue<T>(queues: Map<string, T[]>, projectId: string, event: T): void {
+    const queue = queues.get(projectId) ?? [];
     queue.push(event);
-    this.queues.set(projectId, queue);
+    queues.set(projectId, queue);
     if (queue.length >= REPORT_EAGER_AT) {
       void this.flush();
       return;
     }
     if (this.timer === undefined) {
-      this.timer = setTimeout(() => void this.flush(), REPORT_INTERVAL_MS);
+      this.timer = setTimeout(() => void this.flush(), this.intervalMs);
       // A pending report must never keep a finished server alive.
-      this.timer.unref();
+      // A Worker's timers have no unref.
+      (this.timer as { unref?: () => void }).unref?.();
     }
   }
 
@@ -59,21 +86,21 @@ export class UsageReporter {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
-    const batches: [string, CallEvent[]][] = [];
-    for (const [projectId, queue] of this.queues) {
-      for (let i = 0; i < queue.length; i += REPORT_BATCH) {
-        batches.push([projectId, queue.slice(i, i + REPORT_BATCH)]);
+    const batches: [string, string][] = [];
+    const collect = <T>(queues: Map<string, T[]>, route: string, key: string) => {
+      for (const [projectId, queue] of queues) {
+        for (let i = 0; i < queue.length; i += REPORT_BATCH) {
+          batches.push([
+            `${this.apiUrl}/public/mcp/${encodeURIComponent(projectId)}/${route}`,
+            JSON.stringify({ [key]: queue.slice(i, i + REPORT_BATCH) }),
+          ]);
+        }
       }
-    }
-    this.queues.clear();
-    await Promise.all(
-      batches.map(([projectId, events]) =>
-        this.send(
-          `${this.apiUrl}/public/mcp/${encodeURIComponent(projectId)}/events`,
-          JSON.stringify({ events }),
-        ).catch(() => undefined),
-      ),
-    );
+      queues.clear();
+    };
+    collect(this.queues, "events", "events");
+    collect(this.auditQueues, "audit", "entries");
+    await Promise.all(batches.map(([url, body]) => this.send(url, body).catch(() => undefined)));
   }
 }
 

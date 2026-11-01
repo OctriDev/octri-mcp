@@ -1,3 +1,5 @@
+import { logLine } from "./log.js";
+
 // ─── API client ────────────────────────────────────────────────────────────────
 
 /**
@@ -32,7 +34,7 @@ export async function apiFetch<T>(url: string, options?: RequestInit): Promise<T
     // Full detail goes to the operator's log. The model gets a sentence it can
     // act on: handing it an internal endpoint and a raw error payload told it
     // nothing about which argument to change, and leaked the API's shape.
-    process.stderr.write(`Octri API ${res.status} from ${url}: ${body.slice(0, 500)}\n`);
+    logLine(`Octri API ${res.status} from ${url}: ${body.slice(0, 500)}\n`);
     throw new ApiError(res.status);
   }
 

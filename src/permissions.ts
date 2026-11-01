@@ -1,6 +1,7 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 
 import type { UserPermissions } from "./config.js";
+import { describePlan, type ChainGate, type ChainTool } from "./chains.js";
 import { DEFAULT_ENV_PREFIX } from "./env.js";
 import { describeRequest, type OperationTool, type SendGate } from "./operations.js";
 
@@ -12,12 +13,11 @@ import { describeRequest, type OperationTool, type SendGate } from "./operations
  * was harmless.
  */
 export function operationAnnotations(method: string, destructive?: boolean): Tool["annotations"] {
-  const verb = method.toUpperCase();
-  const readOnly = isReadMethod(verb);
+  const readOnly = isReadMethod(method);
   return {
     readOnlyHint: readOnly,
     destructiveHint: readOnly ? false : (destructive ?? true),
-    idempotentHint: readOnly || verb === "PUT" || verb === "DELETE",
+    idempotentHint: readOnly || method === "PUT" || method === "DELETE",
     // Every operation tool calls a third-party API.
     openWorldHint: true,
   };
@@ -31,13 +31,17 @@ export type ToolPolicy = "auto" | "confirm" | "off";
 /** The parts of a tool its permission is read from. */
 export interface PolicySubject {
   name: string;
+  /** The endpoint slug: stable across every rename. */
+  slug?: string | undefined;
+  /** The SDK name, when the owner renamed the tool on the MCP page. */
+  originalName?: string | undefined;
   policy?: ToolPolicy | undefined;
   http: { method: string };
 }
 
 export function isReadMethod(method: string): boolean {
-  const verb = method.toUpperCase();
-  return verb === "GET" || verb === "HEAD" || verb === "OPTIONS";
+  // Method tokens are case-sensitive: custom `get` is not a safe GET.
+  return method === "GET" || method === "HEAD" || method === "OPTIONS";
 }
 
 /**
@@ -55,7 +59,12 @@ export function userAllowsTool(
   permissions: UserPermissions,
 ): boolean {
   if (toolPolicy(tool) === "off") return false;
-  if (permissions.deny.has(tool.name)) return false;
+  // A deny list written before the owner renamed the tool still holds: it
+  // matches the new name, the old SDK name or the slug. Matching too much
+  // here only ever hides a tool.
+  if ([tool.name, tool.originalName, tool.slug].some((key) => key !== undefined && permissions.deny.has(key))) {
+    return false;
+  }
   return !(permissions.readOnly && !isReadMethod(tool.http.method));
 }
 
@@ -65,7 +74,99 @@ export function needsApproval(
   permissions: UserPermissions,
 ): boolean {
   if (toolPolicy(tool) !== "confirm") return false;
-  return !(permissions.allow.has("*") || permissions.allow.has(tool.name));
+  // Pre-approval matches the current name or the slug, never the old name: an
+  // allow list that stops matching after a rename asks again, which is safe;
+  // one that matched a name now worn by another tool would not be.
+  return !(
+    permissions.allow.has("*") ||
+    permissions.allow.has(tool.name) ||
+    (tool.slug !== undefined && permissions.allow.has(tool.slug))
+  );
+}
+
+// ─── Chained tools ─────────────────────────────────────────────────────────────
+
+/** The key an allow or deny list names a chained tool by, beside its name: `custom:<slug>`. */
+export function chainKey(chain: Pick<ChainTool, "slug">): string {
+  return `custom:${chain.slug}`;
+}
+
+/**
+ * Whether the end user's limits let a chained tool be listed and called. It
+ * inherits every limit of every step: a denied endpoint, an `off` endpoint, or
+ * a write under `--read-only` takes the chain with it, so a chain can never
+ * reach what a direct call could not.
+ */
+export function userAllowsChain(chain: ChainTool, permissions: UserPermissions): boolean {
+  if (permissions.deny.has(chain.name) || permissions.deny.has(chainKey(chain))) return false;
+  return chain.steps.every((step) => userAllowsTool(step.tool, permissions));
+}
+
+/** Whether a chained tool must be approved before it sends anything. */
+export function chainNeedsApproval(chain: ChainTool, permissions: UserPermissions): boolean {
+  // Read off the steps as well as the published policy, so a manifest that
+  // says `auto` over a writing step still asks.
+  const asks = chain.policy === "confirm" || chain.steps.some((step) => !isReadMethod(step.tool.http.method) || toolPolicy(step.tool) === "confirm");
+  if (!asks) return false;
+  return !(permissions.allow.has("*") || permissions.allow.has(chain.name) || permissions.allow.has(chainKey(chain)));
+}
+
+/**
+ * The one gate a chained tool goes through, before its first request: a dry
+ * run returns every planned request unsent, and an "ask first" chain asks once,
+ * listing every request it will send in order.
+ */
+export function chainGate(
+  chain: ChainTool,
+  permissions: UserPermissions,
+  client: {
+    capabilities: () => Parameters<typeof canAskForApproval>[0];
+    ask: (message: string) => Promise<"accept" | "decline" | "cancel">;
+  },
+  envPrefix: string = DEFAULT_ENV_PREFIX,
+): ChainGate {
+  return async (steps) => {
+    const count = `${steps.length} ${steps.length === 1 ? "request" : "requests"}`;
+    if (permissions.dryRun) {
+      return {
+        ok: true,
+        held: "dry_run",
+        text: `Dry run: ${chain.name} would send ${count} in this order. None was sent.\n\n${describePlan(steps)}`,
+      };
+    }
+    if (!chainNeedsApproval(chain, permissions)) return null;
+
+    if (!canAskForApproval(client.capabilities())) {
+      return {
+        ok: false,
+        held: "blocked",
+        text:
+          `Not sent: ${chain.name} needs the user's approval before it runs, and this MCP client cannot ask for it. ` +
+          `Tell the user. They can pre-approve it by setting ${envPrefix}_ALLOW_TOOLS=${chain.name} in this server's environment, ` +
+          `or use a client that supports MCP elicitation (Claude Code, VS Code).`,
+      };
+    }
+
+    let answer: "accept" | "decline" | "cancel";
+    try {
+      answer = await client.ask(
+        `Allow ${chain.name} to call your API? It sends ${count} in this order, each only if the one before succeeded. ` +
+          `Values in {braces} come from an earlier response.\n\n${describePlan(steps)}`,
+      );
+    } catch (err) {
+      return {
+        ok: false,
+        held: "blocked",
+        text: `Not sent: the approval prompt for ${chain.name} did not complete (${err instanceof Error ? err.message : String(err)}).`,
+      };
+    }
+    if (answer === "accept") return null;
+    return {
+      ok: false,
+      held: "declined",
+      text: `Not sent: the user declined ${chain.name}. Nothing was sent. Do not retry it unless they ask you to.`,
+    };
+  };
 }
 
 /** True when the client advertised form elicitation, which is how approval is asked. */

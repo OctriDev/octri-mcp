@@ -24,8 +24,34 @@ export function envName(env: Pick<EnvSource, "prefix">, suffix: string): string 
   return `${env.prefix}_${suffix}`;
 }
 
+/**
+ * A variable's value, or undefined when it is unset or empty. An MCP client
+ * config often carries `"OCTRI_API_BASE_URL": ""` for a setting the person
+ * left blank; read as a value, it would beat the manifest's base URL, or bind
+ * the server to an empty host.
+ */
+export function envValue(vars: NodeJS.ProcessEnv, name: string): string | undefined {
+  const value = vars[name];
+  return value === undefined || value.trim() === "" ? undefined : value;
+}
+
 export function readEnv(env: EnvSource, suffix: string): string | undefined {
-  return env.vars[envName(env, suffix)];
+  return envValue(env.vars, envName(env, suffix));
+}
+
+/**
+ * Drops the settings an MCP Bundle's client passed without a value. A client
+ * fills every `${user_config.*}` in the bundle's manifest, so a setting the
+ * user left empty arrives as "", and from some clients as the unfilled
+ * placeholder. Neither is a value: read as one, "" would send an empty header
+ * name or serve a tool group called "".
+ */
+export function dropUnsetConfig(prefix: string, vars: NodeJS.ProcessEnv = process.env): void {
+  for (const [key, value] of Object.entries(vars)) {
+    if (key.startsWith(`${prefix}_`) && (value === "" || value?.startsWith("${user_config.") === true)) {
+      delete vars[key];
+    }
+  }
 }
 
 const ENABLED = new Set(["1", "true", "yes", "on"]);

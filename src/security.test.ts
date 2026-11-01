@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { refusalResponse } from "./http-guard.js";
 import { resolveOperationUrl, httpRequestRefusal, httpStartupRefusal } from "./index.js";
 
 describe("operation URL resolution", () => {
@@ -95,6 +96,16 @@ describe("HTTP transport token", () => {
       httpRequestRefusal({ host: "mcp.example.test", authorization: "Bearer wrong" }, widened) ?? "",
       /Bearer token is required/,
     );
+  });
+
+  it("answers a missing token with a 401 challenge, and a foreign origin or host with 403", () => {
+    const missing = httpRequestRefusal({ host: "mcp.example.test" }, widened) ?? "";
+    assert.deepEqual(refusalResponse(missing), {
+      status: 401,
+      headers: { "Content-Type": "application/json", "WWW-Authenticate": "Bearer" },
+    });
+    const rebound = httpRequestRefusal({ host: "attacker.test" }, { host: "127.0.0.1", allowedOrigins: new Set() }) ?? "";
+    assert.equal(refusalResponse(rebound).status, 403);
   });
 
   it("serves a request that presents the token", () => {

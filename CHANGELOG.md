@@ -1,5 +1,71 @@
 # Changelog
 
+## 1.4.0
+
+- Tool listings: `--tool-mode` / `OCTRI_TOOL_MODE` takes `all`, `search`, `code`
+  or `auto` and wins over the owner's published mode. `search` lists
+  `search_tools`, `describe_tool` and `call_tool` in place of one tool per
+  endpoint (on the GitHub REST API, `tools/list` drops from about 403,000
+  tokens to about 1,500); `auto` switches to it above the owner's threshold.
+- Code mode: `describe_sdk` shows the API as TypeScript declarations or Python
+  stubs, and `run_code` runs a short script against it in a sandbox (QuickJS
+  for TypeScript, MicroPython for Python, both WebAssembly). Every SDK call a
+  script makes goes through the normal tool call path, so permissions,
+  approval prompts, practice mode, limits and usage apply to each one.
+- Practice mode (`--practice` / `OCTRI_PRACTICE`): every API tool answers with
+  fake data built from the docs, nothing is sent, and within a session created
+  records show up in later reads. `practice_control` arms an error or resets
+  the session.
+- Owner content beyond one tool per endpoint: chained tools (one approval
+  lists every request), prompts, and resources (the pruned OpenAPI spec and
+  chosen guides). Tool groups are served as separate servers (`--group` /
+  `OCTRI_GROUP`), and the owner's per-tool names, descriptions, hidden fields
+  and pinned values apply everywhere.
+- Outage-aware tools: a tool whose endpoint Octri's uptime checks see failing
+  says so before it is called, and a call that fails during that outage
+  returns a structured "known outage, retry later" result. Opt out with
+  `OCTRI_OUTAGE_STATUS=0`.
+- A failed call comes back with a short guide on how to fix it (the endpoint's
+  own error docs first, then the project's guidance, then a built-in hint per
+  status) and the same facts as structured data.
+- What changed: agents get a note on each tool that changed since they last
+  connected, a `what_changed` tool, and a pointer to the new name when they
+  call a renamed or removed tool. npm and bundle servers keep their place in
+  a small state file.
+- Limits set by the owner: writes per session and calls per minute per tool. A
+  refused call returns `limit_reached` with the cap and a retry time; writes
+  are posted to the project's audit log with arguments redacted.
+- `octri-mcp login` / `logout` keep the credential in the system keychain
+  (optional `@napi-rs/keyring`). Results, errors, approval prompts and dry
+  runs drop the session's credentials, also when an API echoes them.
+- Approval prompts go out on the tool call's own stream, so a client that
+  never opens the standalone GET stream no longer waits for them to time out.
+- An empty or blank setting now reads as unset on every entry point, not only
+  the MCP Bundle; `"OCTRI_API_BASE_URL": ""` in a client config no longer beats
+  the project's base URL.
+- A missing or wrong `MCP_AUTH_TOKEN` is now answered with 401 and a Bearer
+  challenge on every HTTP transport (was 403 on Node and Docker); 403 stays for
+  an origin or host the server will not answer.
+- An MCP Bundle per release (`octri-mcp-<version>.mcpb`, attached to the
+  GitHub release and listed in `server.json`): open it in Claude Desktop to
+  install the server, which asks for the project ID and credentials itself.
+  `pnpm pack:mcpb` builds it.
+- `dropUnsetConfig(prefix)` in the library: drops settings an MCP Bundle's
+  client passed empty or unfilled, so they read as unset.
+- `GET /health` on the Streamable HTTP transport, answered without the bearer
+  token, for container and load balancer probes.
+- A Cloudflare Worker host (`dist/worker.js`, bundled as `bundle/worker-core.js`):
+  sessions as Durable Objects, so approval prompts work on Workers. Used by the
+  Worker projects the dashboard generates per release.
+- Worker OAuth consent mode (opt-in, `wrangler.oauth.jsonc`): each user signs
+  in on a consent page and enters their own API key, kept encrypted in the
+  grant. The shared `MCP_AUTH_TOKEN` mode stays the default.
+- Docker image: Node 24, runs as a non-root user, has a health check, and the
+  README's `docker run` now sets `MCP_AUTH_TOKEN`. Without it the image's
+  all-interfaces bind made the server refuse to start, as designed.
+- The Docker image builds again and ships code mode's Python interpreter
+  (`vendor/`); without it the TypeScript build failed.
+
 ## 1.3.0
 
 - Tool permissions. Each operation tool carries the policy its project owner

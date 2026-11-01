@@ -146,7 +146,87 @@ describe("createServer with a static manifest", () => {
     await reporter.flush();
     assert.equal(sent.length, 1);
     assert.equal(sent[0]?.url, "https://api.test/api/v1/public/mcp/p1/events");
-    assert.match(sent[0]?.body ?? "", /"tool":"listPets","outcome":"ok"/);
+    // Events carry the endpoint slug beside the name, so the owner's counts
+    // survive a rename (this fixture's slug equals its name).
+    assert.match(sent[0]?.body ?? "", /"tool":"listPets","slug":"listPets","outcome":"ok"/);
     await client.close();
+  });
+
+  it("serves a renamed tool with its pinned value, and reports it under its slug", async () => {
+    // What the API serves for a tool the owner renamed from listPets to
+    // find_pets, with `limit` pinned to 50 and `cursor` hidden.
+    const customized: OperationTool = {
+      ...tool("listPets", "GET", "auto"),
+      slug: "get-pets",
+      name: "find_pets",
+      originalName: "listPets",
+      inputSchema: { type: "object", properties: { species: { type: "string" } } },
+      http: {
+        method: "GET",
+        path: "/pets",
+        pathParams: [],
+        queryParams: [{ name: "species", wireName: "species" }],
+        bodyParams: [],
+        constants: [{ location: "query", wireName: "limit", value: 50 }],
+      },
+    };
+    const sent: string[] = [];
+    const reporter = new UsageReporter("https://api.test/api/v1", async (_url, body) => {
+      sent.push(body);
+    });
+    const client = await connect({
+      source: {
+        kind: "static",
+        manifest: { ...manifest, tools: [customized] },
+        octri: { apiUrl: "https://api.test/api/v1", projectId: "p1" },
+      },
+      reporter,
+    });
+    const listed = (await client.listTools()).tools.find((t) => t.name === "find_pets");
+    assert.deepEqual(Object.keys(listed?.inputSchema.properties ?? {}), ["species"]);
+
+    // The agent tries to raise the limit; the pin wins.
+    await client.callTool({ name: "find_pets", arguments: { species: "cat", limit: 1000, cursor: "c" } });
+    assert.equal(seen.at(-1)?.url, "/pets?species=cat&limit=50");
+    assert.equal((await client.callTool({ name: "listPets", arguments: {} })).isError, true);
+
+    await reporter.flush();
+    assert.match(sent[0] ?? "", /"tool":"find_pets","slug":"get-pets"/);
+    await client.close();
+
+    // A dry run shows the pinned value in the request it would have sent.
+    const dry = await connect({
+      source: { kind: "static", manifest: { ...manifest, tools: [customized] } },
+      permissions: loadUserPermissions(["--dry-run"], {}),
+    });
+    assert.match(text(await dry.callTool({ name: "find_pets", arguments: { species: "cat" } })), /limit=50/);
+    await dry.close();
+  });
+});
+
+describe("UsageReporter timing", () => {
+  const event = { tool: "listPets", outcome: "ok" as const, durationMs: 5, at: new Date().toISOString() };
+
+  it("sends a quiet queue after the interval it was given", async () => {
+    const sent: string[] = [];
+    const reporter = new UsageReporter("https://api.test/api/v1", async (_url, body) => {
+      sent.push(body);
+    }, 20);
+    reporter.record("p1", event);
+    assert.equal(sent.length, 0);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(sent.length, 1);
+  });
+
+  it("holds a quiet queue for its default interval when given none", async () => {
+    const sent: string[] = [];
+    const reporter = new UsageReporter("https://api.test/api/v1", async (_url, body) => {
+      sent.push(body);
+    });
+    reporter.record("p1", event);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(sent.length, 0);
+    await reporter.flush();
+    assert.equal(sent.length, 1);
   });
 });

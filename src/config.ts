@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 
-import { DEFAULT_ENV_PREFIX, envFlag, envList, type EnvSource } from "./env.js";
+import { DEFAULT_ENV_PREFIX, envFlag, envList, envValue, readEnv, type EnvSource } from "./env.js";
+import { parseToolMode, type ToolMode } from "./tool-search.js";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -40,6 +41,12 @@ export interface Config extends TransportConfig {
   permissions: UserPermissions;
   /** Report each tool call's name and outcome to Octri. */
   telemetry: boolean;
+  /** Serve only this tool group of the project. Absent: every tool. */
+  group?: string;
+  /** How the operation tools are listed. Absent: what the project owner published. */
+  toolMode?: ToolMode;
+  /** Answer every call with fake data from the API's documentation, and send nothing. */
+  practice: boolean;
 }
 
 /**
@@ -65,7 +72,10 @@ export function noUserLimits(): UserPermissions {
 
 function flagValue(args: readonly string[], flag: string): string | undefined {
   const at = args.indexOf(flag);
-  return at === -1 ? undefined : args[at + 1];
+  if (at !== -1) return args[at + 1];
+  // `--flag=value` reads the same as `--flag value`.
+  const joined = args.find((arg) => arg.startsWith(`${flag}=`));
+  return joined?.slice(flag.length + 1);
 }
 
 /**
@@ -78,7 +88,7 @@ export function loadUserPermissions(
   env: NodeJS.ProcessEnv | EnvSource,
 ): UserPermissions {
   const source: EnvSource = isEnvSource(env) ? env : { prefix: DEFAULT_ENV_PREFIX, vars: env };
-  const read = (suffix: string) => source.vars[`${source.prefix}_${suffix}`];
+  const read = (suffix: string) => readEnv(source, suffix);
   const allow = envList(flagValue(args, "--allow-tools") ?? read("ALLOW_TOOLS"));
   if (args.includes("--allow-writes") || envFlag(read("ALLOW_WRITES"))) allow.add("*");
   return {
@@ -102,16 +112,25 @@ export function loadConfig(
   env: EnvSource,
   defaults: { apiUrl?: string } = {},
 ): Config {
-  const read = (suffix: string) => env.vars[`${env.prefix}_${suffix}`];
+  const read = (suffix: string) => readEnv(env, suffix);
+  const group = (flagValue(args, "--group") ?? read("GROUP") ?? "").trim();
   return {
     permissions: loadUserPermissions(args, env),
+    ...(group !== "" ? { group } : {}),
     telemetry: !args.includes("--no-telemetry") && read("TELEMETRY")?.trim() !== "0",
+    practice: args.includes("--practice") || envFlag(read("PRACTICE")),
+    ...optionalToolMode(parseToolMode(flagValue(args, "--tool-mode") ?? read("TOOL_MODE"))),
     projectId: flagValue(args, "--project-id") ?? read("PROJECT_ID") ?? "",
     apiUrl: read("API_URL") ?? defaults.apiUrl ?? DEFAULT_API_URL,
-    transport: env.vars["MCP_TRANSPORT"] ?? "stdio",
-    port: parseInt(env.vars["PORT"] ?? "3000", 10),
-    host: env.vars["MCP_HOST"] ?? "127.0.0.1",
+    transport: envValue(env.vars, "MCP_TRANSPORT") ?? "stdio",
+    port: parseInt(envValue(env.vars, "PORT") ?? "3000", 10),
+    host: envValue(env.vars, "MCP_HOST") ?? "127.0.0.1",
     allowedOrigins: envList(env.vars["MCP_ALLOWED_ORIGINS"]),
-    authToken: env.vars["MCP_AUTH_TOKEN"] ?? "",
+    authToken: envValue(env.vars, "MCP_AUTH_TOKEN") ?? "",
   };
+}
+
+// `exactOptionalPropertyTypes`: an unset mode leaves the key out, not undefined.
+function optionalToolMode(mode: ToolMode | undefined): { toolMode?: ToolMode } {
+  return mode !== undefined ? { toolMode: mode } : {};
 }

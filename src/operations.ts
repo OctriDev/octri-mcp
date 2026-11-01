@@ -2,7 +2,24 @@ import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 
 import { apiFetch } from "./api-client.js";
 import { DEFAULT_ENV_PREFIX, envName, processEnv, readEnv, type EnvSource } from "./env.js";
+import type { ChainTool } from "./chains.js";
+import type { CodeModeManifest } from "./code-sdk.js";
+import type { PracticeData } from "./practice.js";
+import type { ToolChanges } from "./changes.js";
+import type { ToolGroup } from "./groups.js";
+import type { ToolLimits } from "./limits.js";
+import type { PromptTemplate } from "./prompts.js";
+import type { ResourceEntry } from "./resources.js";
 import type { ToolPolicy } from "./permissions.js";
+import { encodeQuerystring } from "./querystring.js";
+import type { ToolMode } from "./tool-search.js";
+
+// Published independently: mirror the shared RFC token validator here.
+const HTTP_METHOD_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+function isHttpMethodToken(value: unknown): value is string {
+  return typeof value === "string" && HTTP_METHOD_TOKEN.test(value);
+}
 
 // ─── Operation tools (executable, config-derived) ───────────────────────────────
 //
@@ -36,11 +53,21 @@ interface RequestBodyMapping {
   encoding?: Record<string, { contentType?: string; headers?: Record<string, unknown>; style?: string; explode?: boolean }>;
 }
 
+/** OpenAPI 3.2 representation of the entire URL query, never a named pair. */
+interface QuerystringMapping {
+  name: string;
+  inputName?: string;
+  required?: boolean;
+  schema?: Record<string, unknown>;
+  content: Record<string, unknown>;
+}
+
 export interface HttpMapping {
   method: string;
   path: string;
   pathParams: ParamBinding[];
   queryParams: ParamBinding[];
+  querystring?: QuerystringMapping;
   /** Declared OpenAPI `in: header` parameters. */
   headerParams?: ParamBinding[];
   /** Declared OpenAPI `in: cookie` parameters. */
@@ -48,6 +75,11 @@ export interface HttpMapping {
   bodyParams: ParamBinding[];
   constants: HttpConstant[];
   requestBody?: RequestBodyMapping;
+  /**
+   * Send only the bound body fields and the constants, never the agent's raw
+   * body. Set when the owner hid or pinned a body field on the MCP page.
+   */
+  strictBody?: boolean;
 }
 
 export interface OperationTool {
@@ -61,12 +93,57 @@ export interface OperationTool {
   policy?: ToolPolicy;
   /** Whether a call can destroy or overwrite data. */
   destructive?: boolean;
+  /** The SDK-derived name, present when the owner renamed the tool. */
+  originalName?: string;
+  /** The owner's tags for the tool. */
+  tags?: string[];
+  /** The folder the endpoint sits in, segments joined by " / ". Absent from older APIs. */
+  group?: string;
+  /** Documented failures from the docs error catalogue. Absent: none documented. */
+  errors?: { status: string; issue: string; scenario?: string; field?: string }[];
+  /** What a failed call is told, per status or class, from this operation's docs. Absent: nothing. */
+  errorHelp?: Record<string, string>;
 }
 
 export interface McpToolsResponse {
   tools: OperationTool[];
   baseUrl: string;
   auth: string;
+  /** The owner's tool groups, membership resolved to endpoint slugs. Absent: none. */
+  groups?: ToolGroup[];
+  /**
+   * The owner's chained tools, prompts and resources. Separate keys, never
+   * entries in `tools`, so a server from before them ignores them.
+   */
+  chains?: ChainTool[];
+  prompts?: PromptTemplate[];
+  resources?: ResourceEntry[];
+  /** The owner's published listing mode. Absent: automatic. */
+  toolMode?: ToolMode;
+  /** Visible tools above which automatic searches. Absent: `SEARCH_MODE_THRESHOLD`. */
+  searchThreshold?: number;
+  /** False when the owner turned outage warnings off. Absent: on. */
+  outageWarnings?: false;
+  /** The project's error guides per status or class, under each tool's own. Absent: none. */
+  errorGuides?: Record<string, string>;
+  /**
+   * The recent releases of the served tools and what each changed. Absent
+   * when the owner turned change notices off, or the API predates them.
+   */
+  changes?: ToolChanges;
+  /**
+   * Each operation's documented answers, what practice mode builds its fake
+   * responses from. Only sent when practice is asked for and the owner turned
+   * it on; absent everywhere else.
+   */
+  practice?: PracticeData;
+  /**
+   * Code mode: the languages the owner turned on and each operation's SDK call
+   * path. Absent when the owner left it off.
+   */
+  codeMode?: CodeModeManifest;
+  /** The owner's spending and safety limits, and whether writes are audited. Absent: none. */
+  limits?: ToolLimits;
 }
 
 // Short-lived per-project cache so a ListTools→CallTool exchange only fetches
@@ -76,17 +153,22 @@ const TOOL_TTL_MS = 30_000;
 // Capped as well, since the project id varies per session over SSE.
 const TOOL_CACHE_MAX = 64;
 
-export async function fetchOperationTools(apiUrl: string, projectId: string): Promise<McpToolsResponse> {
-  const cached = toolCache.get(projectId);
+export async function fetchOperationTools(
+  apiUrl: string,
+  projectId: string,
+  options: { practice?: boolean } = {},
+): Promise<McpToolsResponse> {
+  const key = options.practice === true ? `${projectId}#practice` : projectId;
+  const cached = toolCache.get(key);
   if (cached !== undefined && Date.now() - cached.at < TOOL_TTL_MS) return cached.data;
   const data = await apiFetch<McpToolsResponse>(
-    `${apiUrl}/public/mcp/${encodeURIComponent(projectId)}/tools`,
+    `${apiUrl}/public/mcp/${encodeURIComponent(projectId)}/tools${options.practice === true ? "?practice=1" : ""}`,
   );
   if (toolCache.size >= TOOL_CACHE_MAX) {
     const oldest = toolCache.keys().next();
     if (oldest.done !== true) toolCache.delete(oldest.value);
   }
-  toolCache.set(projectId, { at: Date.now(), data });
+  toolCache.set(key, { at: Date.now(), data });
   return data;
 }
 
@@ -182,7 +264,37 @@ export interface OperationResult {
   ok: boolean;
   text: string;
   /** Set when the request was built but deliberately not sent. */
-  held?: "declined" | "blocked" | "dry_run";
+  held?: "declined" | "blocked" | "dry_run" | "limited";
+  /** Set when the arguments failed the schema check, so no request was built. */
+  invalidArgs?: true;
+  /**
+   * Set when a request was sent and failed: the status it got, or null when no
+   * answer came (timeout, connection refused). What the outage check reads.
+   */
+  failedStatus?: number | null;
+  /** For a chained tool: the step whose request failed. */
+  failedStep?: OperationTool;
+  /** Set when an answer came back failed: what the error guide reads. */
+  failure?: FailedAnswer;
+  /** Set when an answer came back: its status and body, for a code mode script to read as data. */
+  response?: { status: number; body: string };
+}
+
+/** A failed answer as the error guide reads it: the body and the headers that matter. */
+export interface FailedAnswer {
+  status: number;
+  body: string;
+  /** The `Retry-After` header, as sent. */
+  retryAfter?: string;
+}
+
+/** The failed answer the error guide reads, from a sent response. */
+export function failedAnswer(response: SentResponse): FailedAnswer {
+  return {
+    status: response.status,
+    body: response.text,
+    ...(response.retryAfter !== undefined ? { retryAfter: response.retryAfter } : {}),
+  };
 }
 
 /** A fully built API call, shown to the user for approval or returned by a dry run. */
@@ -293,12 +405,15 @@ function operationBodyValue(http: HttpMapping, args: Record<string, unknown>): u
   const supplied = args["body"];
   // Existing metadata exposes object fields separately. New metadata also carries
   // a root schema: retain direct root arrays, text, and binary descriptors.
-  if (http.bodyParams.length === 0 && supplied !== undefined && !isRecord(supplied)) return supplied;
+  const strict = http.strictBody === true;
+  if (!strict && http.bodyParams.length === 0 && supplied !== undefined && !isRecord(supplied)) return supplied;
   const source = isRecord(supplied) ? supplied : {};
   // A root object with no editable bindings still has to retain its supplied
   // fields so body constants can be applied. Root scalar/array values returned
   // above stay untouched.
-  const value: Record<string, unknown> = http.bodyParams.length === 0 ? { ...source } : {};
+  // A strict body never forwards it: the owner hid fields the agent may still
+  // try to send.
+  const value: Record<string, unknown> = http.bodyParams.length === 0 && !strict ? { ...source } : {};
   for (const binding of http.bodyParams) {
     if (source[binding.name] !== undefined) value[binding.wireName] = source[binding.name];
   }
@@ -519,8 +634,7 @@ export function serializeRequestBody(
   args: Record<string, unknown>,
   method: string,
 ): SerializedRequestBody {
-  const verb = method.toUpperCase();
-  if (verb === "GET" || verb === "HEAD") return {};
+  if (method === "GET" || method === "HEAD") return {};
 
   // New metadata distinguishes an optional absent body from legacy projections.
   // Keep legacy `undefined` on the historical JSON `{}` behavior.
@@ -604,6 +718,26 @@ function serializeParameter(value: unknown, binding: ParamBinding, location: Par
 
 interface QueryPair { name: string; value: string; allowReserved: boolean }
 
+function querystringInputName(mapping: QuerystringMapping): string {
+  return mapping.inputName ?? mapping.name;
+}
+
+/** Shared, vendored serializer keeps the published package self-contained. */
+export function serializeWholeQuery(value: unknown, content: Record<string, unknown>): string {
+  return encodeQuerystring(value, content);
+}
+
+function wholeQuery(http: HttpMapping, args: Record<string, unknown>): string | undefined {
+  const mapping = http.querystring;
+  if (mapping === undefined) return undefined;
+  if (http.queryParams.length > 0 || http.constants.some((constant) => constant.location === "query")) {
+    throw new Error("An operation cannot combine an OpenAPI 3.2 whole query with named query parameters or query constants.");
+  }
+  const value = args[querystringInputName(mapping)];
+  if (value === undefined) return undefined;
+  return serializeWholeQuery(value, mapping.content);
+}
+
 function appendQueryParameter(query: QueryPair[], binding: ParamBinding, value: unknown): void {
   const style = binding.style ?? "form";
   const explode = binding.explode ?? (style === "form");
@@ -673,16 +807,64 @@ function isSlackSemanticError(url: URL, responseText: string): boolean {
   }
 }
 
-/** Build + perform the real API call for one operation tool, return a text result. */
-export async function executeOperation(
+const FETCH_NORMALIZED_METHODS = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"]);
+const FETCH_FORBIDDEN_METHODS = new Set(["CONNECT", "TRACE", "TRACK"]);
+
+/** Reject methods Fetch forbids or would silently normalize on the wire. */
+function fetchMethodError(method: string): string | undefined {
+  if (!isHttpMethodToken(method)) {
+    return `Invalid HTTP method token ${JSON.stringify(method)}.`;
+  }
+  const uppercase = method.toUpperCase();
+  if (FETCH_FORBIDDEN_METHODS.has(uppercase)) {
+    return `Cannot execute HTTP method ${JSON.stringify(method)}: Fetch forbids ${uppercase}.`;
+  }
+  if (FETCH_NORMALIZED_METHODS.has(uppercase) && method !== uppercase) {
+    return `Cannot execute custom HTTP method ${JSON.stringify(method)}: Fetch would normalize it to ${uppercase}.`;
+  }
+  return undefined;
+}
+
+/** A request built for one operation call, complete but not sent. */
+export interface BuiltRequest {
+  method: string;
+  url: URL;
+  headers: Headers;
+  body: SerializedRequestBody["body"];
+  /** What an approval prompt or a dry run shows (no headers: they carry credentials). */
+  pending: PendingRequest;
+}
+
+/** What came back from the API, before it is turned into text for an agent. */
+export interface SentResponse {
+  /** 2xx, and not an API that reports failure inside a 200 (Slack). */
+  ok: boolean;
+  status: number;
+  statusText: string;
+  /** The body as text, capped. */
+  text: string;
+  /** The `Retry-After` header, when the API sent one. */
+  retryAfter?: string;
+}
+
+/** The base URL calls go to: the end user's override, else the published one. */
+export function effectiveBaseUrl(meta: Pick<McpToolsResponse, "baseUrl">, env: EnvSource = processEnv()): string {
+  return (readEnv(env, "API_BASE_URL") ?? meta.baseUrl ?? "").replace(/\/+$/, "");
+}
+
+/**
+ * Builds the real API call for one operation tool without sending it: checks
+ * required arguments, serializes path, query, headers and body, and adds the
+ * end user's credentials. The chained-tool engine builds every step through
+ * this, so a step sends exactly what a direct call would.
+ */
+export function buildOperationRequest(
   tool: OperationTool,
   meta: McpToolsResponse,
   args: Record<string, unknown>,
-  gate?: SendGate,
   env: EnvSource = processEnv(),
-  fetchImpl: typeof fetch = fetch,
-): Promise<OperationResult> {
-  const baseUrl = (readEnv(env, "API_BASE_URL") ?? meta.baseUrl ?? "").replace(/\/+$/, "");
+): { ok: true; request: BuiltRequest } | { ok: false; text: string; invalidArgs?: true } {
+  const baseUrl = effectiveBaseUrl(meta, env);
   if (baseUrl === "") {
     return {
       ok: false,
@@ -694,27 +876,43 @@ export async function executeOperation(
     };
   }
 
-  const absent = missingRequired(tool.inputSchema, args);
+  const wholeQueryName = tool.http.querystring === undefined ? undefined : querystringInputName(tool.http.querystring);
+  const absent = missingRequired(tool.inputSchema, args).filter((key) =>
+    key !== wholeQueryName || !Object.hasOwn(args, key) || args[key] === undefined,
+  );
   if (absent.length > 0) {
     return {
       ok: false,
+      invalidArgs: true,
       text: `Error: ${tool.name} is missing required ${absent.length === 1 ? "argument" : "arguments"}: ${absent.join(", ")}.`,
     };
   }
 
   const http = tool.http;
-  const method = http.method.toUpperCase();
+  const method = http.method;
+  const methodError = fetchMethodError(method);
+  if (methodError !== undefined) return { ok: false, text: `Error: ${methodError}` };
   const path = fillPath(http, args);
 
-  const query: QueryPair[] = [];
-  for (const q of http.queryParams) {
-    const v = args[q.name];
-    if (v !== undefined && v !== null && v !== "") appendQueryParameter(query, q, v);
+  let qs: string;
+  try {
+    const completeQuery = wholeQuery(http, args);
+    if (completeQuery !== undefined) {
+      qs = completeQuery;
+    } else {
+      const query: QueryPair[] = [];
+      for (const q of http.queryParams) {
+        const v = args[q.name];
+        if (v !== undefined && v !== null && v !== "") appendQueryParameter(query, q, v);
+      }
+      for (const c of http.constants) {
+        if (c.location === "query") query.push({ name: c.wireName, value: String(c.value), allowReserved: false });
+      }
+      qs = query.map((pair) => `${encodeURIComponent(pair.name)}=${encodeQueryValue(pair.value, pair.allowReserved)}`).join("&");
+    }
+  } catch (err) {
+    return { ok: false, text: `Error: ${err instanceof Error ? err.message : String(err)}` };
   }
-  for (const c of http.constants) {
-    if (c.location === "query") query.push({ name: c.wireName, value: String(c.value), allowReserved: false });
-  }
-  const qs = query.map((pair) => `${encodeURIComponent(pair.name)}=${encodeQueryValue(pair.value, pair.allowReserved)}`).join("&");
 
   let requestBody: SerializedRequestBody;
   try {
@@ -737,29 +935,81 @@ export async function executeOperation(
   // smuggle a second Authorization/Content-Type around the credential policy.
   for (const [name, value] of Object.entries(authHeaders(meta.auth, env))) headers.set(name, value);
 
+  const preview = previewBody(requestBody.body);
+  return {
+    ok: true,
+    request: {
+      method,
+      url,
+      headers,
+      body: requestBody.body,
+      pending: { method, url: url.toString(), ...(preview !== undefined ? { body: preview } : {}) },
+    },
+  };
+}
+
+/** Sends a built request and reads the response, capped. Never waits past the per-call limit. */
+export async function sendOperationRequest(
+  request: BuiltRequest,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs: number = OPERATION_TIMEOUT_MS,
+): Promise<SentResponse> {
+  const res = await fetchImpl(request.url, {
+    method: request.method,
+    headers: request.headers,
+    ...(request.body !== undefined ? { body: request.body } : {}),
+    signal: AbortSignal.timeout(Math.max(1, Math.min(timeoutMs, OPERATION_TIMEOUT_MS))),
+  });
+  const text = await readCapped(res, MAX_RESPONSE_BYTES).catch(() => "");
+  const retryAfter = res.headers.get("retry-after")?.trim();
+  return {
+    ok: res.ok && !isSlackSemanticError(request.url, text),
+    status: res.status,
+    statusText: res.statusText,
+    text,
+    ...(retryAfter !== undefined && retryAfter !== "" ? { retryAfter } : {}),
+  };
+}
+
+/** The text an agent reads for one sent request: the call, its status, the body. */
+export function formatResponse(request: Pick<BuiltRequest, "method" | "url">, response: SentResponse): string {
+  const status = `${response.status}${response.statusText !== "" ? ` ${response.statusText}` : ""}`;
+  return `${request.method} ${request.url} → ${status}\n\n${response.text !== "" ? response.text : "(empty response body)"}`;
+}
+
+/** Build + perform the real API call for one operation tool, return a text result. */
+export async function executeOperation(
+  tool: OperationTool,
+  meta: McpToolsResponse,
+  args: Record<string, unknown>,
+  gate?: SendGate,
+  env: EnvSource = processEnv(),
+  fetchImpl: typeof fetch = fetch,
+): Promise<OperationResult> {
+  const built = buildOperationRequest(tool, meta, args, env);
+  if (!built.ok) return built;
+
   // Last stop before the wire: the request is complete, so an approval prompt
   // or a dry run shows exactly what would be sent (headers aside: they carry
   // the user's credentials).
   if (gate !== undefined) {
-    const body = previewBody(requestBody.body);
-    const held = await gate({ method, url: url.toString(), ...(body !== undefined ? { body } : {}) });
+    const held = await gate(built.request.pending);
     if (held !== null) return held;
   }
-
-  const res = await fetchImpl(url, {
-    method,
-    headers,
-    ...(requestBody.body !== undefined ? { body: requestBody.body } : {}),
-    signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS),
-  });
 
   // Return the raw response (even on 4xx/5xx) so the agent can read the error,
   // but report the transport status honestly: a 4xx surfaced as a successful
   // tool result is indistinguishable from real data to a model.
-  const text = await readCapped(res, MAX_RESPONSE_BYTES).catch(() => "");
-  const status = `${res.status}${res.statusText !== "" ? ` ${res.statusText}` : ""}`;
+  let response: SentResponse;
+  try {
+    response = await sendOperationRequest(built.request, fetchImpl);
+  } catch (err) {
+    return { ok: false, text: `Error: ${err instanceof Error ? err.message : String(err)}`, failedStatus: null };
+  }
   return {
-    ok: res.ok && !isSlackSemanticError(url, text),
-    text: `${method} ${url} → ${status}\n\n${text !== "" ? text : "(empty response body)"}`,
+    ok: response.ok,
+    text: formatResponse(built.request, response),
+    response: { status: response.status, body: response.text },
+    ...(response.ok ? {} : { failedStatus: response.status, failure: failedAnswer(response) }),
   };
 }

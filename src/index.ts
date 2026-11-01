@@ -12,9 +12,12 @@
  * Commands:
  *   octri-mcp [--project-id <id>]    serve (stdio unless MCP_TRANSPORT says otherwise)
  *   octri-mcp doctor [--no-call]     check the setup end to end and say what to fix
+ *   octri-mcp login  [--project-id <id>]  save the API credential in the system keychain
+ *   octri-mcp logout [--project-id <id>]  remove it
  *
  * Env:
  *   OCTRI_PROJECT_ID / --project-id   the project to expose
+ *   OCTRI_GROUP / --group <slug>      serve only this tool group of the project
  *   OCTRI_API_URL                     the Octri API (defaults to prod)
  *   OCTRI_API_BASE_URL                the TARGET API base for operation calls
  *                                     (falls back to the studio's Base URL)
@@ -22,16 +25,33 @@
  *   OCTRI_API_KEY (+ _HEADER)         apiKey value (+ header name, def X-API-Key)
  *   OCTRI_API_USERNAME / _PASSWORD    basic-auth credentials
  *
+ * Credentials set in the env win. Without any, the server reads the one
+ * `login` saved in the system keychain (see keychain.ts), so the client's
+ * config can carry none.
+ *
  * Permissions. The project owner publishes one per tool: run on its own, ask
  * the user first, or off (never listed). A tool that asks first is approved
  * through MCP elicitation; a client that cannot ask gets a refusal instead of
  * an unapproved call. The env below can only narrow what the owner allowed,
  * except that it may pre-approve tools that would otherwise ask:
- *   OCTRI_ALLOW_TOOLS / --allow-tools a,b   run these "ask first" tools without asking ("*" = all)
+ *   OCTRI_ALLOW_TOOLS / --allow-tools a,b   run these "ask first" tools without asking ("*" = all;
+ *                                           tool name or endpoint slug)
  *   OCTRI_ALLOW_WRITES=1 / --allow-writes   same as OCTRI_ALLOW_TOOLS=*
  *   OCTRI_READ_ONLY=1 / --read-only         list and run only tools that read
- *   OCTRI_DENY_TOOLS / --deny-tools a,b     never list or run these tools
+ *   OCTRI_DENY_TOOLS / --deny-tools a,b     never list or run these tools (name, the SDK
+ *                                           name before an owner's rename, or endpoint slug)
  *   OCTRI_DRY_RUN=1 / --dry-run             build each API call and return it unsent
+ *   OCTRI_PRACTICE=1 / --practice           practice mode: every call answers with fake data
+ *                                           built from the API's documentation, nothing is
+ *                                           sent and no credential is needed. The owner must
+ *                                           turn practice mode on for the project.
+ *
+ * Tool listing. One tool per endpoint floods a client's context once an API has
+ * more than a few dozen of them. Search mode lists search_tools, describe_tool
+ * and call_tool (plus list_tool_groups) in their place; every permission above
+ * still applies to each call. The project owner picks the mode on the MCP page;
+ * this overrides it either way:
+ *   OCTRI_TOOL_MODE / --tool-mode all|search|code|auto   auto = search above 40 tools; code = scripts against the SDK
  *
  * Usage. Each tool call is reported to Octri (tool name, outcome, duration and
  * the client's name; never arguments or responses) so the owner can see which
@@ -65,22 +85,55 @@
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
+import { localChangeState } from "./change-state.js";
+import { nodeCodeSandbox } from "./code-sandbox-node.js";
 import { loadConfig } from "./config.js";
 import { formatDoctor, runDoctor } from "./doctor.js";
 import { processEnv } from "./env.js";
+import { runLogin, runLogout, systemKeychain, terminalIo, withKeychainCredential } from "./keychain.js";
+import { fetchOperationTools } from "./operations.js";
 import { createServer } from "./server.js";
 import { httpStartupRefusal, startSse, startStdio, startStreamableHttp } from "./transports.js";
 import { processUsageReporter } from "./usage.js";
 
 // The library surface, for hosts that build on this package and for the tests.
 export * from "./core.js";
+export { serializeWholeQuery } from "./operations.js";
 
 // ─── Entry point ───────────────────────────────────────────────────────────────
 
+/** The keychain entry for one project. */
+function keychainAccount(projectId: string): string {
+  return `project:${projectId}`;
+}
+
 async function main(): Promise<void> {
-  const env = processEnv();
   const args = process.argv.slice(2);
-  const config = loadConfig(args, env);
+  const config = loadConfig(args, processEnv());
+
+  // `octri-mcp login` / `logout`: the credential in the system keychain.
+  if (args[0] === "login" || args[0] === "logout") {
+    if (config.projectId === "") throw new Error("Pass --project-id <id> (or set OCTRI_PROJECT_ID) so the credential is saved for that project.");
+    const store = await systemKeychain("octri-mcp");
+    const io = terminalIo();
+    try {
+      const account = keychainAccount(config.projectId);
+      if (args[0] === "logout") process.exitCode = await runLogout({ account, store, envPrefix: "OCTRI", io });
+      else {
+        // The scheme decides what to ask for.
+        const { auth } = await fetchOperationTools(config.apiUrl, config.projectId);
+        process.exitCode = await runLogin({ auth, account, envPrefix: "OCTRI", store, io });
+      }
+    } finally {
+      io.close();
+    }
+    return;
+  }
+
+  const { env, source: credentialSource } =
+    config.projectId !== ""
+      ? await withKeychainCredential(processEnv(), keychainAccount(config.projectId), await systemKeychain("octri-mcp"))
+      : { env: processEnv(), source: "none" as const };
 
   // `octri-mcp doctor`: check the setup, print what to fix, exit.
   if (args[0] === "doctor") {
@@ -90,6 +143,9 @@ async function main(): Promise<void> {
       permissions: config.permissions,
       telemetry: config.telemetry,
       call: !args.includes("--no-call"),
+      credentialSource,
+      ...(config.group !== undefined ? { group: config.group } : {}),
+      practice: config.practice,
     });
     process.stdout.write(formatDoctor(checks));
     process.exit(checks.some((c) => c.status === "fail") ? 1 : 0);
@@ -101,12 +157,28 @@ async function main(): Promise<void> {
   }
 
   const reporter = config.telemetry ? processUsageReporter(config.apiUrl) : undefined;
+  // One agent per stdio process, so its place in the release history is kept
+  // on this machine. An HTTP server is shared, and starts from recent releases.
+  const changeState =
+    config.transport === "stdio" && config.projectId !== ""
+      ? localChangeState(env, { projectId: config.projectId, group: config.group })
+      : undefined;
+  // Code mode's sandbox, compiled once per process; the server falls back to
+  // search mode if it cannot load.
+  const codeSandbox = nodeCodeSandbox();
   const makeServer = () =>
     createServer({
       source: { kind: "live", apiUrl: config.apiUrl, projectId: config.projectId },
+      ...(changeState !== undefined ? { changes: changeState } : {}),
       env,
       permissions: config.permissions,
+      // Who can fix a refused credential: env, keychain, or nobody set one.
+      credentialOrigin: credentialSource,
       ...(reporter !== undefined ? { reporter } : {}),
+      ...(config.group !== undefined ? { group: config.group } : {}),
+      ...(config.toolMode !== undefined ? { toolMode: config.toolMode } : {}),
+      practice: config.practice,
+      codeSandbox,
     });
 
   if (config.transport === "http" || config.transport === "streamable-http") {

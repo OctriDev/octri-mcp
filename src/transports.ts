@@ -1,4 +1,4 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import http from "node:http";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -6,84 +6,16 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 
+import { HEALTH_BODY, httpRequestRefusal, refusalResponse } from "./http-guard.js";
+import { HTTP_SESSION_IDLE_MS, MAX_HTTP_SESSIONS } from "./session-limits.js";
 import type { TransportConfig } from "./config.js";
+
+export { httpRequestRefusal, httpStartupRefusal } from "./http-guard.js";
+export { HTTP_SESSION_IDLE_MS, MAX_HTTP_SESSIONS } from "./session-limits.js";
 
 // ─── SSE transport (remote hosting) ───────────────────────────────────────────
 
 const MAX_SSE_SESSIONS = 64;
-
-/** Drops a trailing `:port`, unwrapping a bracketed IPv6 literal on the way. */
-function bareHost(host: string): string {
-  const trimmed = host.trim().toLowerCase();
-  if (trimmed.startsWith("[")) {
-    const end = trimmed.indexOf("]");
-    return end === -1 ? trimmed.slice(1) : trimmed.slice(1, end);
-  }
-  // One colon is host:port. More than one is a bare IPv6 address.
-  const parts = trimmed.split(":");
-  return parts.length === 2 ? (parts[0] ?? "") : trimmed;
-}
-
-function isLoopback(host: string): boolean {
-  const bare = bareHost(host);
-  return bare === "localhost" || bare === "::1" || /^127\.\d+\.\d+\.\d+$/.test(bare);
-}
-
-/**
- * Guards both HTTP transports against a browser on the same machine. This server
- * holds API credentials, and any page the user visits can reach a loopback port.
- * An unlisted `Origin` marks a browser request and is refused; a non-loopback
- * `Host` catches DNS rebinding, which otherwise arrives looking local.
- *
- * Returns an error string when the request must be refused.
- */
-export function httpRequestRefusal(
-  headers: http.IncomingHttpHeaders,
-  config: Pick<TransportConfig, "host" | "allowedOrigins"> & Partial<Pick<TransportConfig, "authToken">>,
-): string | null {
-  const origin = headers.origin;
-  if (typeof origin === "string" && origin !== "") {
-    if (!config.allowedOrigins.has(origin)) {
-      return `Origin ${origin} is not allowed. Set MCP_ALLOWED_ORIGINS to permit it.`;
-    }
-  }
-
-  // Every request answers with this server's API credentials, so once it is
-  // reachable from the network the caller has to prove who it is.
-  const token = config.authToken ?? "";
-  if (token !== "" && !sameSecret(headers.authorization ?? "", `Bearer ${token}`)) {
-    return "A valid Authorization: Bearer token is required.";
-  }
-
-  // Only meaningful while bound to loopback. A widened MCP_HOST means the
-  // operator is fronting this themselves.
-  if (isLoopback(config.host)) {
-    const host = headers.host ?? "";
-    if (!isLoopback(host)) {
-      return `Host ${host === "" ? "(missing)" : host} is not the loopback interface.`;
-    }
-  }
-
-  return null;
-}
-
-/** Constant-time comparison, so response timing says nothing about the token. */
-function sameSecret(presented: string, expected: string): boolean {
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
-/**
- * Refuses to serve HTTP on a non-loopback interface without MCP_AUTH_TOKEN.
- * Bound wider, anyone who can reach the port used the operator's API
- * credentials, and the README's "behind a proxy you control" was the only
- * thing in the way.
- */
-export function httpStartupRefusal(config: Pick<TransportConfig, "host" | "authToken">): string | null {
-  if (isLoopback(config.host) || config.authToken !== "") return null;
-  return `MCP_HOST=${config.host} is not the loopback interface. Set MCP_AUTH_TOKEN so only callers with the token can use this server.`;
-}
 
 /** A fresh server per session (SSE) or per request (Streamable HTTP). */
 export type ServerFactory = () => Server;
@@ -106,7 +38,8 @@ export async function startSse(
 
     const refusal = httpRequestRefusal(req.headers, config);
     if (refusal !== null) {
-      res.writeHead(403, { "Content-Type": "application/json" });
+      const { status, headers } = refusalResponse(refusal);
+      res.writeHead(status, headers);
       res.end(JSON.stringify({ error: `Forbidden: ${refusal}` }));
       return;
     }
@@ -175,11 +108,6 @@ export async function startStdio(makeServer: ServerFactory): Promise<void> {
 
 // ─── Streamable HTTP transport (current spec, for remote hosting) ─────────────
 
-/** A session nobody has used for this long is closed. */
-export const HTTP_SESSION_IDLE_MS = 30 * 60_000;
-/** Open sessions per process. A new one past this is refused until one closes. */
-export const MAX_HTTP_SESSIONS = 256;
-
 interface HttpSession {
   server: Server;
   transport: StreamableHTTPServerTransport;
@@ -234,14 +162,24 @@ export async function startStreamableHttp(
   setInterval(() => void sweep(), 60_000).unref();
 
   const httpServer = http.createServer((req, res) => {
-    const refusal = httpRequestRefusal(req.headers, config);
+    const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
+    // A container or load balancer probe carries no token, so the health check
+    // skips it. The origin and host checks still apply, and the answer says
+    // nothing about the API.
+    const health = req.method === "GET" && url.pathname === "/health";
+    const refusal = httpRequestRefusal(req.headers, health ? { ...config, authToken: "" } : config);
     if (refusal !== null) {
-      res.writeHead(403, { "Content-Type": "application/json" });
+      const { status, headers } = refusalResponse(refusal);
+      res.writeHead(status, headers);
       res.end(JSON.stringify({ error: `Forbidden: ${refusal}` }));
       return;
     }
+    if (health) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(HEALTH_BODY);
+      return;
+    }
 
-    const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
     if (url.pathname !== "/mcp") {
       res.writeHead(404);
       res.end("Not found");
@@ -311,6 +249,7 @@ export async function startStreamableHttp(
 
   process.stderr.write(
     `${label} (Streamable HTTP) listening on http://${config.host}:${config.port}\n` +
-      `  MCP endpoint: POST /mcp (sessions: route by the mcp-session-id header)\n`,
+      `  MCP endpoint: POST /mcp (sessions: route by the mcp-session-id header)\n` +
+      `  Health check: GET  /health\n`,
   );
 }

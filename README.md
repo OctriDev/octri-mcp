@@ -58,7 +58,13 @@ Listed in the official MCP Registry as `dev.octri/mcp`.
 
 ### Claude Desktop
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+One click: download `octri-mcp-<version>.mcpb` from the
+[latest release](https://github.com/octridev/octri-mcp/releases/latest) and open
+it. Claude Desktop installs the server and asks for the project ID and the
+API's credentials, keeping secrets in the system keychain. No Node install, no
+config file.
+
+Or by hand: add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
@@ -112,6 +118,7 @@ Add to `.vscode/mcp.json`:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `OCTRI_PROJECT_ID` | Yes* | None | The project to connect to. Can also be set via `--project-id` CLI flag. |
+| `OCTRI_GROUP` | No | None | Serve only one tool group the project owner published (for example `billing`). Can also be set via `--group`. A group the project does not have serves no tools. |
 | `OCTRI_API_URL` | No | `https://api.octri.dev/api/v1` | Override the API base URL for local development or an authorized private test endpoint. Hosted Octri self-hosting is not available. |
 | `MCP_TRANSPORT` | No | `stdio` | `http` for remote hosting (Streamable HTTP), or `sse` for the legacy transport. |
 | `PORT` | No | `3000` | HTTP port for the `http` and `sse` transports. |
@@ -152,14 +159,24 @@ brings back a tool the owner turned off:
 | Variable | Flag | Effect |
 |----------|------|--------|
 | `OCTRI_READ_ONLY=1` | `--read-only` | List and run only tools that read. |
-| `OCTRI_DENY_TOOLS=a,b` | `--deny-tools a,b` | Never list or run these tools. |
-| `OCTRI_ALLOW_TOOLS=a,b` | `--allow-tools a,b` | Run these "ask first" tools without asking (`*` for all). |
+| `OCTRI_DENY_TOOLS=a,b` | `--deny-tools a,b` | Never list or run these tools. Matches a tool's name, its endpoint slug, or the name it had before the project owner renamed it. |
+| `OCTRI_ALLOW_TOOLS=a,b` | `--allow-tools a,b` | Run these "ask first" tools without asking (`*` for all). Matches a tool's current name or its endpoint slug; after a rename, an old name asks again. |
 | `OCTRI_ALLOW_WRITES=1` | `--allow-writes` | Same as `OCTRI_ALLOW_TOOLS=*`. |
 | `OCTRI_DRY_RUN=1` | `--dry-run` | Build each call and return it to the agent unsent. |
+| `OCTRI_PRACTICE=1` | `--practice` | Practice mode: answer every call with fake data built from the API's documentation, keeping records the agent creates for the session. Nothing is sent and no credential is needed. The project's owner must turn practice mode on. |
+
+### Tool groups
+
+A project owner can split the tools into groups, each served as its own MCP
+server, so a team connects only the tools a job needs. Pass `--group <slug>` (or
+set `OCTRI_GROUP`) to serve one. Inside a group every tool keeps the owner's
+permissions and the limits above: a group only takes tools away. Each group can
+also be reached hosted, at `https://api.octri.dev/api/v1/public/mcp/<project id>/g/<group>/mcp`.
 
 ### Usage reporting
 
-Each tool call reports its tool name, outcome, duration and the client's name to
+Each tool call reports its tool name, outcome, duration, tool group (when one is
+served) and the client's name to
 Octri, so the project owner can see which tools agents use. Arguments and
 responses are never sent. Set `OCTRI_TELEMETRY=0` or pass `--no-telemetry` to
 turn it off.
@@ -176,10 +193,15 @@ client tries first:
 docker build -t octri-mcp .
 
 docker run -p 3000:3000 \
-  -e MCP_TRANSPORT=http \
+  -e MCP_AUTH_TOKEN=<a long random token> \
   -e OCTRI_PROJECT_ID=YOUR_PROJECT_ID \
   octri-mcp
 ```
+
+The image binds all interfaces, so it refuses to start without
+`MCP_AUTH_TOKEN`; clients send it as `Authorization: Bearer <token>`. It runs as
+a non-root user, and `GET /health` answers a container or load balancer probe
+without the token.
 
 It serves a single endpoint, `/mcp`. A client's first request opens a session
 and gets its id back in the `mcp-session-id` header; every later request
@@ -219,6 +241,23 @@ npx -y @octri/mcp doctor --project-id YOUR_PROJECT_ID
 Confirms the project and its tools load, the base URL and credentials are set,
 and makes one real read call, then says what to fix if anything fails.
 `--no-call` skips the call. Exits non-zero on a failure.
+
+---
+
+## Keep the credential out of the config
+
+```bash
+npx -y @octri/mcp login --project-id YOUR_PROJECT_ID
+```
+
+Asks for the API credential the project's scheme needs and saves it in your
+system keychain (macOS Keychain, Windows Credential Manager, or the Secret
+Service on Linux). Your MCP client's config then needs no `OCTRI_API_*`
+variable. A variable set in the config still wins. `logout` removes it.
+
+The keychain store, `@napi-rs/keyring`, is an optional dependency. Where it
+cannot install or the system has no secret store, `login` says so and env
+variables work as before.
 
 ---
 
@@ -267,10 +306,15 @@ when it is given an Octri project (`octri: { apiUrl, projectId }`).
 
 ```bash
 pnpm build
+pnpm pack:mcpb
 npm publish --access public
+gh release upload v<version> octri-mcp-<version>.mcpb --repo octridev/octri-mcp
+mcp-publisher publish
 ```
 
-Requires an npm account with access to the `@octri` scope.
+Requires an npm account with access to the `@octri` scope. `pack:mcpb` writes
+the MCP Bundle and points `server.json` at it on the GitHub release, so upload
+that exact file before `mcp-publisher publish`.
 
 ---
 
