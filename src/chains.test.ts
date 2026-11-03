@@ -403,6 +403,13 @@ describe("chained tools on a server", () => {
     await client.close();
   });
 
+  it("leaves out the prompts a plugin ships as commands, from the list and from get", async () => {
+    const client = await connect({ skipPrompts: new Set(["bill_customer"]) });
+    assert.deepEqual((await client.listPrompts()).prompts, []);
+    await assert.rejects(client.getPrompt({ name: "bill_customer", arguments: { email: "a@b.co" } }), /Unknown prompt: bill_customer/);
+    await client.close();
+  });
+
   it("lists resources and reads their contents from the Octri project", async () => {
     const client = await connect({});
     assert.deepEqual((await client.listResources()).resources.map((r) => [r.uri, r.mimeType]), [

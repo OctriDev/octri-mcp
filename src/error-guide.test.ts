@@ -191,6 +191,12 @@ describe("buildErrorGuide: credentials", () => {
     });
   }
 
+  it("tells a client that sent no credential to add one, not to check it", () => {
+    const result = guide(401, { origin: "client", tool: listPets, credentialSent: false });
+    assert.match(result.text, /sends no API credential.*add their API key to this server's headers/);
+    assert.doesNotMatch(result.text, /refused the credential/);
+  });
+
   it("keeps the docs' word and adds who can fix it", () => {
     const result = guide(401, { origin: "signin", tool: listPets, projectGuides: { "401": "Tokens last an hour." } });
     assert.match(result.text, /From the API's docs: Tokens last an hour\.\n.*reconnect/);

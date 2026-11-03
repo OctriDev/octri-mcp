@@ -18,6 +18,7 @@
  * Env:
  *   OCTRI_PROJECT_ID / --project-id   the project to expose
  *   OCTRI_GROUP / --group <slug>      serve only this tool group of the project
+ *   OCTRI_SKIP_PROMPTS / --skip-prompts <a,b>  leave these prompts out (a plugin's commands)
  *   OCTRI_API_URL                     the Octri API (defaults to prod)
  *   OCTRI_API_BASE_URL                the TARGET API base for operation calls
  *                                     (falls back to the studio's Base URL)
@@ -177,6 +178,7 @@ async function main(): Promise<void> {
       ...(reporter !== undefined ? { reporter } : {}),
       ...(config.group !== undefined ? { group: config.group } : {}),
       ...(config.toolMode !== undefined ? { toolMode: config.toolMode } : {}),
+      ...(config.skipPrompts.size > 0 ? { skipPrompts: config.skipPrompts } : {}),
       practice: config.practice,
       codeSandbox,
     });

@@ -42,6 +42,8 @@ export interface ErrorGuideInput {
   origin: CredentialOrigin;
   /** The variables the credential is read from, for the `env` and `none` hints. */
   credentialVars?: readonly string[];
+  /** False when the call went out with no credential at all: a `client` that configured none. */
+  credentialSent?: boolean;
   /** The call came through call_tool, where the agent may not have read the schema. */
   viaCallTool?: boolean;
   /** For a chained tool: the step that failed, named in the heading. */
@@ -259,9 +261,12 @@ function humanSeconds(seconds: number): string {
 
 // ─── Built-in hints ───────────────────────────────────────────────────────────
 
-function credentialHint(status: 401 | 403, origin: CredentialOrigin, vars: readonly string[]): string {
+function credentialHint(status: 401 | 403, origin: CredentialOrigin, vars: readonly string[], sent: boolean): string {
   const named = vars.length > 0 ? vars.join(" or ") : "the API credential variable";
   if (status === 401) {
+    if (origin === "client" && !sent) {
+      return "This MCP client sends no API credential, and this endpoint needs one. Changing the arguments will not help: ask the user to add their API key to this server's headers in their client's config, as its install snippet shows.";
+    }
     switch (origin) {
       case "stored":
         return "The API refused the key the project owner stored for this installation. Changing the arguments will not help: tell the user the stored key needs updating in Octri.";
@@ -398,7 +403,7 @@ export function buildErrorGuide(input: ErrorGuideInput): ErrorGuide {
   if (slot !== undefined) lines.push(`The error points at argument \`${slot.argument}\` (${describeSlot(slot)}). Fix that value.`);
 
   if (status === 401 || status === 403) {
-    lines.push(credentialHint(status, input.origin, input.credentialVars ?? []));
+    lines.push(credentialHint(status, input.origin, input.credentialVars ?? [], input.credentialSent !== false));
   } else if (documented === undefined) {
     lines.push(builtInHint(status));
   }

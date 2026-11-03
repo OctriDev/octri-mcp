@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.1
+
+- `--skip-prompts` / `OCTRI_SKIP_PROMPTS` leaves the named prompts out of
+  `prompts/list` and `prompts/get`. A project's Claude Code plugin passes the
+  prompts it already ships as slash commands, so each appears once in
+  Claude Code's `/` menu.
+
 ## 1.4.0
 
 - Tool listings: `--tool-mode` / `OCTRI_TOOL_MODE` takes `all`, `search`, `code`

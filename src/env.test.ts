@@ -33,4 +33,10 @@ describe("readEnv", () => {
     assert.equal(config.transport, "stdio");
     assert.notEqual(config.apiUrl, "");
   });
+
+  it("reads the prompts to leave out from --skip-prompts, else the env", () => {
+    assert.deepEqual([...loadConfig(["--skip-prompts", "a, b"], { prefix: "ACME", vars: { ACME_SKIP_PROMPTS: "c" } }).skipPrompts], ["a", "b"]);
+    assert.deepEqual([...loadConfig([], { prefix: "ACME", vars: { ACME_SKIP_PROMPTS: "c" } }).skipPrompts], ["c"]);
+    assert.equal(loadConfig([], { prefix: "ACME", vars: {} }).skipPrompts.size, 0);
+  });
 });

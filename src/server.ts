@@ -84,7 +84,7 @@ import {
   PracticeSession,
   runPracticeControl,
 } from "./practice.js";
-import { getPrompt, listPrompts } from "./prompts.js";
+import { getPrompt, listPrompts, type PromptTemplate } from "./prompts.js";
 import { buildErrorGuide, credentialVarNames, type CredentialOrigin, type ErrorGuide } from "./error-guide.js";
 import { credentialSecrets, redactSecrets } from "./redact.js";
 import {
@@ -196,6 +196,12 @@ export interface CreateServerOptions {
    * over the owner's published mode. Default: the owner's mode, else `auto`.
    */
   toolMode?: ToolMode;
+  /**
+   * Prompts not served, by name (`--skip-prompts`, or `?skip_prompts=` on a
+   * hosted URL): a Claude Code plugin passes the ones it ships as commands, so
+   * its `/` menu lists each once. Default: every prompt.
+   */
+  skipPrompts?: ReadonlySet<string>;
   /**
    * Checks the answers to approval prompts against their schema. Default: the
    * MCP SDK's own (Ajv), which compiles schemas into code at runtime. A
@@ -852,6 +858,7 @@ export function createServer(options: CreateServerOptions): Server {
       tools: data.tools.filter((candidate) => userAllowsTool(candidate, permissions)),
       origin: options.credentialOrigin ?? (credentialSet(env) ? "env" : "none"),
       credentialVars: credentialVarNames(data.auth, env.prefix),
+      credentialSent: credentialSet(env),
       viaCallTool,
       ...(step !== undefined ? { step } : {}),
     });
@@ -1430,14 +1437,16 @@ Input schema for ${tool.name}: ${JSON.stringify(tool.inputSchema)}`
   // Resource contents are read from the Octri project, like the docs tools.
   const servesResources = withDocs;
 
+  const servedPrompts = (all: PromptTemplate[]) => all.filter((p) => options.skipPrompts?.has(p.name) !== true);
+
   server.setRequestHandler(ListPromptsRequestSchema, async () => {
     const data = await loadQuietly();
-    return { prompts: listPrompts(data?.prompts ?? []) };
+    return { prompts: listPrompts(servedPrompts(data?.prompts ?? [])) };
   });
 
   server.setRequestHandler(GetPromptRequestSchema, async (request) => {
     const data = await loadQuietly();
-    const prompts = data?.prompts ?? [];
+    const prompts = servedPrompts(data?.prompts ?? []);
     const result = getPrompt(prompts, request.params.name, request.params.arguments ?? {});
     const prompt = prompts.find((p) => p.name === request.params.name);
     if (prompt !== undefined) {

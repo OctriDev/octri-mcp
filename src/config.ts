@@ -47,6 +47,8 @@ export interface Config extends TransportConfig {
   toolMode?: ToolMode;
   /** Answer every call with fake data from the API's documentation, and send nothing. */
   practice: boolean;
+  /** Prompts left out, by name: those a Claude Code plugin already ships as its own commands. */
+  skipPrompts: Set<string>;
 }
 
 /**
@@ -119,6 +121,7 @@ export function loadConfig(
     ...(group !== "" ? { group } : {}),
     telemetry: !args.includes("--no-telemetry") && read("TELEMETRY")?.trim() !== "0",
     practice: args.includes("--practice") || envFlag(read("PRACTICE")),
+    skipPrompts: envList(flagValue(args, "--skip-prompts") ?? read("SKIP_PROMPTS")),
     ...optionalToolMode(parseToolMode(flagValue(args, "--tool-mode") ?? read("TOOL_MODE"))),
     projectId: flagValue(args, "--project-id") ?? read("PROJECT_ID") ?? "",
     apiUrl: read("API_URL") ?? defaults.apiUrl ?? DEFAULT_API_URL,

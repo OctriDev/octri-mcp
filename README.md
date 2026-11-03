@@ -119,6 +119,7 @@ Add to `.vscode/mcp.json`:
 |----------|----------|---------|-------------|
 | `OCTRI_PROJECT_ID` | Yes* | None | The project to connect to. Can also be set via `--project-id` CLI flag. |
 | `OCTRI_GROUP` | No | None | Serve only one tool group the project owner published (for example `billing`). Can also be set via `--group`. A group the project does not have serves no tools. |
+| `OCTRI_SKIP_PROMPTS` | No | None | Prompts to leave out, by name, comma-separated. Can also be set via `--skip-prompts`. The project's Claude Code plugin sets it for the prompts it already ships as slash commands, so each shows once. |
 | `OCTRI_API_URL` | No | `https://api.octri.dev/api/v1` | Override the API base URL for local development or an authorized private test endpoint. Hosted Octri self-hosting is not available. |
 | `MCP_TRANSPORT` | No | `stdio` | `http` for remote hosting (Streamable HTTP), or `sse` for the legacy transport. |
 | `PORT` | No | `3000` | HTTP port for the `http` and `sse` transports. |
