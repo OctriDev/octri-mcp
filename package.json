@@ -1,6 +1,6 @@
 {
   "name": "@octri/mcp",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "mcpName": "dev.octri/mcp",
   "description": "MCP server for an Octri project: search its API docs and call its endpoints from Claude, Cursor, and other clients",
   "keywords": [
@@ -26,7 +26,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "octri-mcp": "./dist/index.js"
+    "octri-mcp": "dist/index.js"
   },
   "files": [
     "dist/**",

@@ -56,7 +56,8 @@ const DOCS_TOOLS: Tool[] = [
   },
   {
     name: "list_endpoints",
-    description: "List all available API endpoints",
+    description:
+      "List the API's endpoints and guides, grouped by section. A large API lists its sections with endpoint counts instead: pass `section` to list one of them.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -66,7 +67,7 @@ const DOCS_TOOLS: Tool[] = [
         },
         section: {
           type: "string",
-          description: "Filter by section/tag name",
+          description: "Only the sections whose name contains this text",
         },
       },
       required: [],
@@ -120,7 +121,7 @@ const DOCS_TOOLS: Tool[] = [
         },
         groupSlug: {
           type: "string",
-          description: "The guide's section slug, if it belongs to one",
+          description: "The guide's group (list_endpoints shows it). Optional: found from the site's navigation when omitted.",
         },
       },
       required: ["slug"],
@@ -129,7 +130,7 @@ const DOCS_TOOLS: Tool[] = [
   {
     name: "get_sdk_methods",
     description:
-      "Show how to call this API through its generated SDKs. Ready-to-use code snippets per endpoint in every supported language. Use `slug` (from list_endpoints) to focus on one endpoint, and `language` (e.g. typescript, python, go) to focus on one language.",
+      "Show how to call this API through its generated SDKs. With `slug` (from list_endpoints or search_docs): ready-to-use code for that endpoint in every SDK language, or in one with `language` (e.g. typescript, python, go). Without `slug`: the index of SDK methods, one line per endpoint.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -139,7 +140,7 @@ const DOCS_TOOLS: Tool[] = [
         },
         slug: {
           type: "string",
-          description: "Focus on a single endpoint by its slug. Omit to return all endpoints.",
+          description: "One endpoint by its slug. Omit for the index of methods.",
         },
         language: {
           type: "string",
@@ -223,15 +224,20 @@ interface CodeExample {
   code: string;
 }
 
-interface DocPage {
-  slug: string;
-  title: string;
+interface PageContent {
   description?: string;
-  method?: string;
-  path?: string;
   parameters?: Parameter[];
   responses?: Record<string, ResponseEntry>;
   codeExamples?: CodeExample[];
+}
+
+interface DocPage extends PageContent {
+  slug: string;
+  title: string;
+  method?: string;
+  path?: string;
+  /** Where the public page route keeps the generated documentation. */
+  content?: PageContent | null;
 }
 
 interface PageResponse {
@@ -240,8 +246,11 @@ interface PageResponse {
   spec: { version: string | null };
 }
 
-function formatEndpoint(data: PageResponse): string {
-  const { page, project, spec } = data;
+export function formatEndpoint(data: PageResponse): string {
+  const { project, spec } = data;
+  // The public page route nests the documentation under `content`; the fields
+  // were once top-level, and reading only those printed a title and a path.
+  const page: DocPage = { ...data.page, ...(data.page.content ?? {}) };
   const lines: string[] = [];
 
   lines.push(`# ${page.title}`);
@@ -308,8 +317,11 @@ export async function getEndpoint(
 interface NavItem {
   slug: string;
   title: string;
+  /** "endpoint", "guide" or "link"; a link's slug is its URL. */
+  type?: string;
   method?: string;
   path?: string;
+  groupSlug?: string;
 }
 
 interface NavSection {
@@ -317,38 +329,79 @@ interface NavSection {
   items: NavItem[];
 }
 
-interface NavResponse {
-  sections: NavSection[];
+interface NavTab {
+  label: string;
+  sections?: NavSection[];
 }
 
-function formatNav(data: NavResponse, section: string | undefined): string {
-  let sections = data.sections;
+export interface NavResponse {
+  sections: NavSection[];
+  /** A tabbed site: `sections` is only the first tab, each tab carries its own. */
+  tabs?: NavTab[];
+}
 
-  if (section !== undefined && section !== "") {
+/**
+ * Above this many endpoints a full listing costs the model more context than it
+ * is worth (GitHub's 1,242 run past 100 KB), so the sections are listed with
+ * their counts and `section` opens one.
+ */
+const FULL_LISTING_MAX_ENDPOINTS = 150;
+
+/** Every section of the site, each tab's under its label when the site has tabs. */
+function navSections(data: NavResponse): { tab: string | null; section: NavSection }[] {
+  const tabs = data.tabs ?? [];
+  if (tabs.length === 0) return data.sections.map((section) => ({ tab: null, section }));
+  return tabs.flatMap((t) => (t.sections ?? []).map((section) => ({ tab: t.label, section })));
+}
+
+function isEndpoint(item: NavItem): boolean {
+  return item.method !== undefined && item.path !== undefined;
+}
+
+function formatNavItem(item: NavItem): string {
+  if (isEndpoint(item)) return `  - **${item.title}** \`${item.method} ${item.path}\` (slug: \`${item.slug}\`)`;
+  // A link leaves the docs site: no tool reads it, so it carries no slug.
+  if (item.type === "link") return `  - **${item.title}**: ${item.slug}`;
+  const group = item.groupSlug !== undefined ? `, groupSlug: \`${item.groupSlug}\`` : "";
+  return `  - **${item.title}** (guide, slug: \`${item.slug}\`${group})`;
+}
+
+export function formatNav(data: NavResponse, section: string | undefined): string {
+  let sections = navSections(data).filter((s) => s.section.items.length > 0);
+  const filtered = section !== undefined && section !== "";
+
+  if (filtered) {
     const lower = section.toLowerCase();
-    sections = sections.filter((s) => s.title.toLowerCase().includes(lower));
+    sections = sections.filter((s) => s.section.title.toLowerCase().includes(lower));
   }
 
   if (sections.length === 0) {
-    return section !== undefined
-      ? `No endpoints found in section "${section}".`
-      : "No endpoints found.";
+    return filtered ? `No section matches "${section}".` : "No endpoints found.";
   }
 
-  return sections
-    .map((s) => {
-      const items = s.items
-        .map((item) => {
-          const badge =
-            item.method !== undefined && item.path !== undefined
-              ? ` \`${item.method} ${item.path}\``
-              : "";
-          return `  - **${item.title}**${badge} (slug: \`${item.slug}\`)`;
-        })
-        .join("\n");
-      return `### ${s.title}\n${items}`;
-    })
-    .join("\n\n");
+  const total = sections.reduce((n, s) => n + s.section.items.filter(isEndpoint).length, 0);
+  const compact = !filtered && total > FULL_LISTING_MAX_ENDPOINTS;
+
+  let lastTab: string | null = null;
+  const blocks = sections.map(({ tab, section: s }) => {
+    const heading = tab !== null && tab !== lastTab ? `## ${tab}\n\n` : "";
+    lastTab = tab;
+    const endpoints = s.items.filter(isEndpoint);
+    // Compact: an endpoint section becomes one line; guides and links stay, they are few.
+    const shown = compact ? s.items.filter((i) => !isEndpoint(i)) : s.items;
+    const lines = shown.map(formatNavItem);
+    if (compact && endpoints.length > 0) lines.push(`  - ${endpoints.length} endpoint${endpoints.length === 1 ? "" : "s"}`);
+    return `${heading}### ${s.title}\n${lines.join("\n")}`;
+  });
+
+  const lead = compact
+    ? `${total} endpoints, too many to list at once. Pass \`section\` with a section name below to list its endpoints, or use search_docs.\n\n`
+    : "";
+  return lead + blocks.join("\n\n");
+}
+
+async function fetchNav(apiUrl: string, projectId: string): Promise<NavResponse> {
+  return apiFetch<NavResponse>(`${apiUrl}/public/docs/${encodeURIComponent(projectId)}/nav`);
 }
 
 export async function listEndpoints(
@@ -356,10 +409,7 @@ export async function listEndpoints(
   projectId: string,
   section: string | undefined,
 ): Promise<string> {
-  const data = await apiFetch<NavResponse>(
-    `${apiUrl}/public/docs/${encodeURIComponent(projectId)}/nav`,
-  );
-  return formatNav(data, section);
+  return formatNav(await fetchNav(apiUrl, projectId), section);
 }
 
 // ─── Tool: get_changelog ───────────────────────────────────────────────────────
@@ -530,9 +580,17 @@ export async function getGuide(
   groupSlug: string | undefined,
 ): Promise<string> {
   const pid = encodeURIComponent(projectId);
-  const path =
+  // A guide in a group is only served under its group, and models rarely pass
+  // one: the navigation says which group a slug belongs to.
+  const group =
     groupSlug !== undefined && groupSlug !== ""
-      ? `${apiUrl}/public/docs/${pid}/guides/${encodeURIComponent(groupSlug)}/${encodeURIComponent(slug)}`
+      ? groupSlug
+      : navSections(await fetchNav(apiUrl, projectId))
+          .flatMap((s) => s.section.items)
+          .find((i) => i.type === "guide" && i.slug === slug)?.groupSlug;
+  const path =
+    group !== undefined
+      ? `${apiUrl}/public/docs/${pid}/guides/${encodeURIComponent(group)}/${encodeURIComponent(slug)}`
       : `${apiUrl}/public/docs/${pid}/guides/${encodeURIComponent(slug)}`;
 
   const data = await apiFetch<{ guide: PublicGuide }>(path);
@@ -570,7 +628,10 @@ function formatSdkMethods(data: SdkMethodsResponse, slug: string | undefined): s
       const blocks = Object.entries(ep.snippets)
         .map(([lang, code]) => `**${lang}**\n\`\`\`${lang}\n${code}\n\`\`\``)
         .join("\n\n");
-      return `## ${ep.title}: \`${ep.methodName}()\`\n\`${id}\`\n\n${blocks}`;
+      // No method name in the heading: `methodName` is the flat generator name
+      // (`apiKeysList`), not the call the SDK exposes (`client.apiKeys.list()`),
+      // which the code below shows.
+      return `## ${ep.title}\n\`${id}\`\n\n${blocks}`;
     })
     .join("\n\n---\n\n");
 }
@@ -584,11 +645,31 @@ export async function getSdkMethods(
   const params = new URLSearchParams();
   if (slug !== undefined && slug !== "") params.set("slug", slug);
   if (language !== undefined && language !== "") params.set("language", language);
+  const index = slug === undefined || slug === "";
+  // The index prints no code, so one language's snippets are all it needs to
+  // fetch: every language of every endpoint ran past a megabyte for Twilio.
+  if (index && !params.has("language")) params.set("language", "typescript");
   const qs = params.toString();
   const url = `${apiUrl}/public/sdk/${encodeURIComponent(projectId)}/methods${qs !== "" ? `?${qs}` : ""}`;
 
   const data = await apiFetch<SdkMethodsResponse>(url);
-  return formatSdkMethods(data, slug);
+  return index ? formatSdkMethodIndex(data) : formatSdkMethods(data, slug);
+}
+
+/** The API's own cap on endpoints per methods response. */
+const SDK_METHODS_PAGE = 200;
+
+export function formatSdkMethodIndex(data: SdkMethodsResponse): string {
+  if (data.endpoints.length === 0) return "No SDK methods are available for this project yet.";
+  const rows = data.endpoints.map((ep) => {
+    const id = `${ep.method ?? ""} ${ep.path ?? ""}`.trim();
+    return `- **${ep.title}**${id !== "" ? ` \`${id}\`` : ""} (slug: \`${ep.slug}\`)`;
+  });
+  const more =
+    data.endpoints.length >= SDK_METHODS_PAGE
+      ? `\n\nThe first ${SDK_METHODS_PAGE} endpoints by path. Use search_docs to find the slug of any other.`
+      : "";
+  return `${rows.join("\n")}\n\nPass \`slug\` to get the code for one endpoint in every SDK language.${more}`;
 }
 
 // ─── Dispatch ──────────────────────────────────────────────────────────────────

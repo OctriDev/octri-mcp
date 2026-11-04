@@ -75,12 +75,16 @@ export async function runPython(module: WasmModule, job: SandboxJob, bridge: San
   const totalLimit = new Promise<"total">((resolve) => {
     timer = setTimeout(() => resolve("total"), job.limits.totalMs);
   });
-  let code: number | "total" | "crashed";
+  let code: number | "total" | "crashed" | "recursion";
   try {
     code = await Promise.race([python.ccall("octri_exec", "number", ["number", "number"], [src, size], { async: true }), totalLimit]);
-  } catch {
-    // The wasm trapped (an abort): nothing the script could catch.
-    code = "crashed";
+  } catch (trap) {
+    // The wasm trapped: nothing the script could catch. On a host thread with
+    // a small native stack (about 1 MB on a Node main thread) the wasm frames
+    // under deep recursion use it up a little before the Python stack runs
+    // out, and the host throws RangeError. That is the script's recursion, so
+    // it reads as Python's own error, not as an interpreter fault.
+    code = trap instanceof RangeError ? "recursion" : "crashed";
   } finally {
     ended = true;
     clearTimeout(timer);
@@ -89,6 +93,7 @@ export async function runPython(module: WasmModule, job: SandboxJob, bridge: San
   const base = { logs: logs.text(), logsTruncated: logs.truncated };
   if (code === 2 || code === "total") return { ...base, status: "timeout", error: TIMEOUT_TEXT(job.limits) };
   if (code === "crashed") return { ...base, status: "crashed", error: "The Python interpreter stopped unexpectedly." };
+  if (code === "recursion") return { ...base, status: "error", error: "RuntimeError: maximum recursion depth exceeded" };
   if (code === 1) {
     const trace = ownTrace(errors.text(), job, SCRIPT_LINE);
     if (/^MemoryError\b/m.test(trace)) return { ...base, status: "memory", error: MEMORY_TEXT(job.limits) };

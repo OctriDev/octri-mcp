@@ -20,12 +20,12 @@
       "sizes": ["192x192"]
     }
   ],
-  "version": "1.4.1",
+  "version": "1.4.2",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@octri/mcp",
-      "version": "1.4.1",
+      "version": "1.4.2",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
@@ -81,9 +81,9 @@
     },
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/octridev/octri-mcp/releases/download/v1.4.1/octri-mcp-1.4.1.mcpb",
-      "version": "1.4.1",
-      "fileSha256": "563e1cda09e180bd1e13597eed1d50149866de19c5b96887558cbfed3eca37b6",
+      "identifier": "https://github.com/octridev/octri-mcp/releases/download/v1.4.2/octri-mcp-1.4.2.mcpb",
+      "version": "1.4.2",
+      "fileSha256": "a27c95d17be725a65a52eebbb2c856cfc6eb30140af14dda335aa00e1861f839",
       "transport": {
         "type": "stdio"
       }

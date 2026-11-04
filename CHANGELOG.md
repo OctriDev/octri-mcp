@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.2
+
+- The docs tools read what the docs site serves. `list_endpoints` walks every
+  tab of the navigation, not only the first, and above 150 endpoints it lists
+  the sections and asks for one instead of returning a listing too long to
+  use. `get_endpoint` reads the page's documentation, which it used to miss.
+  `get_guide` finds a guide from its slug alone. `get_sdk_methods` with no
+  endpoint lists one line per method to pick from, without the code.
+- Python code mode: a script that recurses without end now fails with
+  `RuntimeError: maximum recursion depth exceeded` wherever it runs. When the
+  sandbox ran on a host thread with a small stack, it came back as the
+  interpreter crashing.
+
 ## 1.4.1
 
 - `--skip-prompts` / `OCTRI_SKIP_PROMPTS` leaves the named prompts out of
