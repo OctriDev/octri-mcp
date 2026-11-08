@@ -117,7 +117,7 @@ const DOCS_TOOLS: Tool[] = [
         },
         slug: {
           type: "string",
-          description: "The guide slug (from list_endpoints)",
+          description: "The guide slug, from search_docs or list_endpoints",
         },
         groupSlug: {
           type: "string",
@@ -178,6 +178,36 @@ interface SearchResult {
   title: string;
   method?: string;
   path?: string;
+  type?: string;
+  /** A guide's section. `get_guide` can't find a guide in a section without it. */
+  groupSlug?: string | null;
+}
+
+/**
+ * How to read a page the docs listed: the slug, and for a guide in a section
+ * the `groupSlug` too, which `get_guide` needs to find it.
+ */
+function readBy(item: { slug: string; type?: string; groupSlug?: string | null }): string {
+  const group = item.type === "guide" && typeof item.groupSlug === "string" && item.groupSlug !== ""
+    ? `, groupSlug: \`${item.groupSlug}\``
+    : "";
+  return `slug: \`${item.slug}\`${group}`;
+}
+
+export function formatSearchResults(results: readonly SearchResult[]): string {
+  if (results.length === 0) {
+    return "No results found for that query.";
+  }
+
+  return results
+    .map((r, i) => {
+      const badge =
+        r.method !== undefined && r.path !== undefined
+          ? ` \`${r.method} ${r.path}\``
+          : r.type === "guide" ? " (guide)" : "";
+      return `${i + 1}. **${r.title}**${badge}\n   ${readBy(r).replace(/^slug/, "Slug")}`;
+    })
+    .join("\n\n");
 }
 
 export async function searchDocs(
@@ -189,21 +219,7 @@ export async function searchDocs(
   const all = await apiFetch<SearchResult[]>(
     `${apiUrl}/public/docs/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(query)}`,
   );
-  const results = all.slice(0, limit);
-
-  if (results.length === 0) {
-    return "No results found for that query.";
-  }
-
-  return results
-    .map((r, i) => {
-      const badge =
-        r.method !== undefined && r.path !== undefined
-          ? ` \`${r.method} ${r.path}\``
-          : "";
-      return `${i + 1}. **${r.title}**${badge}\n   Slug: \`${r.slug}\``;
-    })
-    .join("\n\n");
+  return formatSearchResults(all.slice(0, limit));
 }
 
 // ─── Tool: get_endpoint ────────────────────────────────────────────────────────
@@ -224,20 +240,36 @@ interface CodeExample {
   code: string;
 }
 
-interface PageContent {
+interface RequestBodyField {
+  name: string;
+  type: string;
   description?: string;
+  required: boolean;
+}
+
+/** An endpoint's documentation, as the public pages route nests it under `content`. */
+interface EndpointContent {
+  description?: string;
+  deprecated?: boolean;
+  deprecationNote?: string;
   parameters?: Parameter[];
+  requestBody?: { contentType?: string; fields?: RequestBodyField[] };
   responses?: Record<string, ResponseEntry>;
   codeExamples?: CodeExample[];
 }
 
-interface DocPage extends PageContent {
+/**
+ * A page from the public pages route. Its documentation is under `content`;
+ * the same fields at the top level are the shape this tool was first written
+ * against, still read so an older API keeps answering.
+ */
+interface DocPage extends EndpointContent {
   slug: string;
   title: string;
   method?: string;
   path?: string;
   /** Where the public page route keeps the generated documentation. */
-  content?: PageContent | null;
+  content?: EndpointContent | null;
 }
 
 interface PageResponse {
@@ -246,11 +278,16 @@ interface PageResponse {
   spec: { version: string | null };
 }
 
+/** " *(required)*: description", or the parts of it a field has. */
+function fieldTail(required: boolean, description: string | undefined): string {
+  const req = required ? " *(required)*" : "";
+  const desc = description !== undefined && description.trim() !== "" ? `: ${description.trim()}` : "";
+  return `${req}${desc}`;
+}
+
 export function formatEndpoint(data: PageResponse): string {
-  const { project, spec } = data;
-  // The public page route nests the documentation under `content`; the fields
-  // were once top-level, and reading only those printed a title and a path.
-  const page: DocPage = { ...data.page, ...(data.page.content ?? {}) };
+  const { page, project, spec } = data;
+  const content: EndpointContent = page.content ?? page;
   const lines: string[] = [];
 
   lines.push(`# ${page.title}`);
@@ -261,23 +298,39 @@ export function formatEndpoint(data: PageResponse): string {
   }
   lines.push("");
 
-  if (page.description !== undefined && page.description !== "") {
-    lines.push(page.description);
+  if (content.deprecated === true) {
+    const note = content.deprecationNote?.trim() ?? "";
+    lines.push(`**Deprecated.**${note !== "" ? ` ${note}` : ""}`);
     lines.push("");
   }
 
-  if (page.parameters !== undefined && page.parameters.length > 0) {
+  // A generated page's description is often its title again, which says nothing new.
+  const description = content.description?.trim() ?? "";
+  if (description !== "" && description !== page.title.trim()) {
+    lines.push(description);
+    lines.push("");
+  }
+
+  if (content.parameters !== undefined && content.parameters.length > 0) {
     lines.push("## Parameters");
-    for (const p of page.parameters) {
-      const req = p.required ? " *(required)*" : "";
-      const desc = p.description !== undefined ? `: ${p.description}` : "";
-      lines.push(`- **${p.name}** (${p.in})${req}${desc}`);
+    for (const p of content.parameters) {
+      lines.push(`- **${p.name}** (${p.in})${fieldTail(p.required, p.description)}`);
     }
     lines.push("");
   }
 
-  if (page.responses !== undefined) {
-    const entries = Object.entries(page.responses);
+  const bodyFields = content.requestBody?.fields ?? [];
+  if (bodyFields.length > 0) {
+    const type = content.requestBody?.contentType;
+    lines.push(`## Request body${type !== undefined && type !== "" ? ` (${type})` : ""}`);
+    for (const f of bodyFields) {
+      lines.push(`- **${f.name}** (${f.type})${fieldTail(f.required, f.description)}`);
+    }
+    lines.push("");
+  }
+
+  if (content.responses !== undefined) {
+    const entries = Object.entries(content.responses);
     if (entries.length > 0) {
       lines.push("## Responses");
       for (const [code, resp] of entries) {
@@ -288,9 +341,9 @@ export function formatEndpoint(data: PageResponse): string {
     }
   }
 
-  if (page.codeExamples !== undefined && page.codeExamples.length > 0) {
+  if (content.codeExamples !== undefined && content.codeExamples.length > 0) {
     lines.push("## Code Examples");
-    for (const ex of page.codeExamples) {
+    for (const ex of content.codeExamples) {
       lines.push(`\`\`\`${ex.language}`);
       lines.push(ex.code);
       lines.push("```");
@@ -321,7 +374,7 @@ interface NavItem {
   type?: string;
   method?: string;
   path?: string;
-  groupSlug?: string;
+  groupSlug?: string | null;
 }
 
 interface NavSection {
@@ -362,8 +415,7 @@ function formatNavItem(item: NavItem): string {
   if (isEndpoint(item)) return `  - **${item.title}** \`${item.method} ${item.path}\` (slug: \`${item.slug}\`)`;
   // A link leaves the docs site: no tool reads it, so it carries no slug.
   if (item.type === "link") return `  - **${item.title}**: ${item.slug}`;
-  const group = item.groupSlug !== undefined ? `, groupSlug: \`${item.groupSlug}\`` : "";
-  return `  - **${item.title}** (guide, slug: \`${item.slug}\`${group})`;
+  return `  - **${item.title}** (guide, ${readBy(item)})`;
 }
 
 export function formatNav(data: NavResponse, section: string | undefined): string {
@@ -431,6 +483,49 @@ interface ChangelogEntry {
   generatedAt: string;
   markdown?: string | null;
   summary?: ChangelogSummary | null;
+  /** The entry's spec diff as JSON. Only the detail route sends it, on every plan. */
+  diffRaw?: string;
+}
+
+/** The parts of a serialized spec diff (`SpecDiff` in @octri/shared) this tool reads. */
+interface DiffEndpoint {
+  method?: string;
+  path?: string;
+  status?: string;
+  changes?: { description?: string; breaking?: string }[];
+}
+
+/** Endpoints listed per entry, so one large release can't fill an agent's context. */
+const CHANGELOG_DIFF_ENDPOINTS = 15;
+
+/**
+ * An entry's changes, read from its diff: one line per endpoint that changed,
+ * with what changed beneath it. Undefined when the diff can't be read.
+ */
+function diffLines(diffRaw: string): string[] | undefined {
+  let endpoints: DiffEndpoint[];
+  try {
+    const parsed = JSON.parse(diffRaw) as { endpoints?: unknown };
+    if (!Array.isArray(parsed.endpoints)) return undefined;
+    endpoints = (parsed.endpoints as DiffEndpoint[]).filter((e) => e.status !== undefined && e.status !== "unchanged");
+  } catch {
+    return undefined;
+  }
+  const lines: string[] = [];
+  for (const endpoint of endpoints.slice(0, CHANGELOG_DIFF_ENDPOINTS)) {
+    lines.push(`- **${endpoint.method ?? ""} ${endpoint.path ?? ""}** ${endpoint.status ?? ""}`.replace(/\s+/g, " ").trim());
+    if (endpoint.status !== "changed") continue;
+    for (const change of endpoint.changes ?? []) {
+      const text = change.description?.trim() ?? "";
+      if (text === "") continue;
+      const flag = change.breaking === "breaking" ? " (breaking)" : "";
+      lines.push(`  - ${text}${flag}`);
+    }
+  }
+  if (endpoints.length > CHANGELOG_DIFF_ENDPOINTS) {
+    lines.push(`- and ${endpoints.length - CHANGELOG_DIFF_ENDPOINTS} more endpoints`);
+  }
+  return lines;
 }
 
 interface ChangelogListResponse {
@@ -469,8 +564,11 @@ export function formatChangelog(
         "",
       ];
 
+      const fromDiff = entry.diffRaw !== undefined ? diffLines(entry.diffRaw) : undefined;
       if (entry.markdown !== null && entry.markdown !== undefined) {
         lines.push(entry.markdown);
+      } else if (fromDiff !== undefined && fromDiff.length > 0) {
+        lines.push(...fromDiff);
       } else if (entry.summary !== null && entry.summary !== undefined) {
         lines.push(`- Added: ${entry.summary.added}`);
         lines.push(`- Removed: ${entry.summary.removed}`);
@@ -508,10 +606,21 @@ export async function getChangelog(
   projectId: string,
   breakingOnly: boolean,
 ): Promise<string> {
-  const data = await apiFetch<ChangelogListResponse>(
-    `${apiUrl}/public/changelog/${encodeURIComponent(projectId)}`,
+  const base = `${apiUrl}/public/changelog/${encodeURIComponent(projectId)}`;
+  const data = await apiFetch<ChangelogListResponse>(base);
+  // The list carries each entry's heading only; what changed is on the entry's
+  // own route. Fetch it for the few entries shown, keeping the heading when one fails.
+  const shown = (breakingOnly ? data.changelogs.filter((e) => e.hasBreakingChanges) : data.changelogs).slice(0, 3);
+  const detailed = await Promise.all(
+    shown.map(async (entry) => {
+      try {
+        return { ...entry, ...(await apiFetch<ChangelogEntry>(`${base}/${encodeURIComponent(entry.id)}`)) };
+      } catch {
+        return entry;
+      }
+    }),
   );
-  return formatChangelog(data.changelogs, breakingOnly, data.release);
+  return formatChangelog(detailed, breakingOnly, data.release);
 }
 
 // ─── Tool: list_sdks ───────────────────────────────────────────────────────────
@@ -556,12 +665,19 @@ interface PublicGuide {
   group: { slug: string; title: string } | null;
 }
 
-/** Crudely turns the compiled HTML into readable plain text for AI context. */
-function htmlToText(html: string): string {
+/**
+ * Turns the compiled HTML into readable plain text for AI context. Headings
+ * keep their Markdown level and list items their bullet, so an agent can still
+ * tell a section from the paragraph under it.
+ */
+export function htmlToText(html: string): string {
   return html
     .replace(/<\s*(script|style)\b[^>]*>[\s\S]*?<\/\s*\1\s*>/gi, "")
+    .replace(/<\s*h([1-6])\b[^>]*>/gi, (_tag, level: string) => `\n\n${"#".repeat(Number(level))} `)
+    .replace(/<\s*li\b[^>]*>/gi, "\n- ")
     .replace(/<\s*br\s*\/?>/gi, "\n")
-    .replace(/<\/\s*(p|div|li|h[1-6]|pre|tr)\s*>/gi, "\n")
+    // A list item's line starts at its opening tag, so its close adds none.
+    .replace(/<\/\s*(p|div|h[1-6]|pre|tr)\s*>/gi, "\n")
     .replace(/<[^>]+>/g, "")
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
@@ -587,7 +703,7 @@ export async function getGuide(
       ? groupSlug
       : navSections(await fetchNav(apiUrl, projectId))
           .flatMap((s) => s.section.items)
-          .find((i) => i.type === "guide" && i.slug === slug)?.groupSlug;
+          .find((i) => i.type === "guide" && i.slug === slug)?.groupSlug ?? undefined;
   const path =
     group !== undefined
       ? `${apiUrl}/public/docs/${pid}/guides/${encodeURIComponent(group)}/${encodeURIComponent(slug)}`
