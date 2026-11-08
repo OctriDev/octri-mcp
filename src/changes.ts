@@ -170,6 +170,20 @@ function mergeParams(into: FoldedChange["params"], params: ToolChange["params"])
 }
 
 /**
+ * Whether one release's change breaks calls for a reason besides a rename: a
+ * parameter removed, newly required or narrowed, or (for a chain) a step. The
+ * release keeps one flag, so a renamed chain whose steps changed counts as both.
+ */
+function breaksBesidesRename(change: ToolChange): boolean {
+  if (change.status !== "renamed") return change.breaking;
+  const p = change.params;
+  const params =
+    p !== undefined &&
+    ((p.removed?.length ?? 0) > 0 || p.added?.some((a) => a.required) === true || p.changed?.some((c) => c.breaking) === true);
+  return params || (change.breaking && (change.steps?.length ?? 0) > 0);
+}
+
+/**
  * Every change of the given releases, one entry per tool. A tool added and then
  * removed within them is left out: the agent never knew it.
  */
@@ -177,6 +191,9 @@ export function foldChanges(releases: readonly ToolRelease[]): FoldedChange[] {
   const folded = new Map<string, FoldedChange>();
   // An operation that moved path shows up under a new slug: keep it one entry.
   const alias = new Map<string, string>();
+  // Per entry: whether any release broke calls for a reason other than a rename,
+  // which is all that is left when a later release renames the tool back.
+  const breaksOtherwise = new Map<string, boolean>();
   for (const release of releases) {
     for (const change of release.tools) {
       if (change.status === "regrouped") continue;
@@ -201,8 +218,10 @@ export function foldChanges(releases: readonly ToolRelease[]): FoldedChange[] {
         };
         if (change.status !== "added") mergeParams(fresh.params, change.params);
         folded.set(key, fresh);
+        breaksOtherwise.set(key, change.status !== "added" && breaksBesidesRename(change));
         continue;
       }
+      breaksOtherwise.set(key, breaksOtherwise.get(key) === true || breaksBesidesRename(change));
       entry.releases.push(release.release);
       entry.slug = change.slug;
       for (const step of change.steps ?? []) if (!entry.steps.includes(step)) entry.steps.push(step);
@@ -242,12 +261,16 @@ export function foldChanges(releases: readonly ToolRelease[]): FoldedChange[] {
         if (change.name === known) {
           delete entry.previousName;
           entry.status = "changed";
+          // Back under the name the agent knows: only what else changed can break its calls.
+          entry.breaking = breaksOtherwise.get(key) === true;
         } else {
           entry.previousName = known;
           entry.status = "renamed";
+          entry.breaking = true;
         }
+      } else if (change.breaking) {
+        entry.breaking = true;
       }
-      if (change.breaking) entry.breaking = true;
       mergeParams(entry.params, change.params);
     }
   }

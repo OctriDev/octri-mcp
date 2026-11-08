@@ -145,6 +145,22 @@ describe("foldChanges", () => {
     );
   });
 
+  it("doesn't call a rename undone breaking, unless something else broke", () => {
+    const describedOnly = foldChanges([
+      { release: 2, at: at(3), tools: [{ slug: "a", name: "b", previousName: "a", status: "renamed", breaking: true, description: true }] },
+      { release: 3, at: at(2), tools: [{ slug: "a", name: "a", previousName: "b", status: "renamed", breaking: true, description: true }] },
+    ]);
+    assert.deepEqual(
+      { status: describedOnly[0]?.status, breaking: describedOnly[0]?.breaking, description: describedOnly[0]?.description },
+      { status: "changed", breaking: false, description: true },
+    );
+    const paramRemoved = foldChanges([
+      { release: 2, at: at(3), tools: [{ slug: "a", name: "b", previousName: "a", status: "renamed", breaking: true, params: { removed: ["x"] } }] },
+      { release: 3, at: at(2), tools: [{ slug: "a", name: "a", previousName: "b", status: "renamed", breaking: true }] },
+    ]);
+    assert.equal(paramRemoved[0]?.breaking, true);
+  });
+
   it("keeps an operation that moved path as one entry, by its previous slug", () => {
     const folded = foldChanges([
       { release: 4, at: at(3), tools: [{ slug: "get-v1-orders", name: "orders.list", status: "changed", breaking: false, description: true }] },
