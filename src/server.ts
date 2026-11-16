@@ -46,6 +46,7 @@ import {
 } from "./changes.js";
 import { noUserLimits, SERVER_VERSION, type UserPermissions } from "./config.js";
 import { isDocsTool, runDocsTool, TOOLS } from "./docs-tools.js";
+import { guideTools, isGuideTool, runGuideTool, type GuideAuthoring } from "./guide-authoring.js";
 import { narrowToGroup, servedGroup, UnknownGroupError } from "./groups.js";
 import { logLine } from "./log.js";
 import { envName, processEnv, readEnv, type EnvSource } from "./env.js";
@@ -172,6 +173,13 @@ export interface ServerBranding {
 
 export interface CreateServerOptions {
   source: ToolSource;
+  /**
+   * Turns on the guide authoring tools (octri_create_guide and the rest) with
+   * this project-scoped Octri API key. Only a host that knows who is calling
+   * sets it: Octri's hosted server, for a teammate signed in to a team
+   * installation. Default: no guide tools.
+   */
+  guides?: GuideAuthoring;
   /** Default: `@octri/mcp` at this package's version. */
   branding?: ServerBranding;
   /** Where credentials and limits are read. Default: the process env under `OCTRI_`. */
@@ -469,6 +477,10 @@ export function createServer(options: CreateServerOptions): Server {
   const withDocs = home !== undefined && home.docs !== false;
   const docsTools: Tool[] = withDocs ? TOOLS : [];
   const servesDocs = (name: string) => withDocs && isDocsTool(name);
+  // A read-only or dry-run session gets the guide reads only.
+  const guideList: Tool[] =
+    options.guides !== undefined && home !== undefined ? guideTools(options.guides, !permissions.readOnly && !permissions.dryRun) : [];
+  const servesGuides = (name: string) => isGuideTool(guideList, name);
 
   // Code mode's sandbox, which a Node host loads in the background.
   let codeSandbox: CodeSandbox | undefined;
@@ -834,7 +846,7 @@ export function createServer(options: CreateServerOptions): Server {
         );
       }
     }
-    return { tools: [...(listDocs ? docsTools : []), ...opTools] };
+    return { tools: [...(listDocs ? docsTools : []), ...guideList, ...opTools] };
   });
 
   const safeResult = (text: string, isError = false) => textResult(redact(text), isError);
@@ -1207,6 +1219,7 @@ Input schema for ${tool.name}: ${JSON.stringify(tool.inputSchema)}`
         if (
           isMetaTool(target) ||
           servesDocs(target) ||
+          servesGuides(target) ||
           (target === WHAT_CHANGED && servesWhatChanged(data)) ||
           (target === PRACTICE_CONTROL && servesPracticeControl(data))
         ) {
@@ -1238,6 +1251,12 @@ Input schema for ${tool.name}: ${JSON.stringify(tool.inputSchema)}`
     };
 
     try {
+      if (servesGuides(name) && options.guides !== undefined) {
+        counted = name;
+        const text = await runGuideTool(name, a, home?.apiUrl ?? "", projectId, options.guides);
+        report("ok");
+        return safeResult(text);
+      }
       // Operation tools (executable, config-derived) aren't in the static docs
       // set, so resolve + perform the real API call for them.
       if (!servesDocs(name) || !(await docsServed(projectId))) {
