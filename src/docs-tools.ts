@@ -1,6 +1,6 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 
-import { apiFetch } from "./api-client.js";
+import { ApiError, apiFetch } from "./api-client.js";
 
 // ─── Tool schemas ──────────────────────────────────────────────────────────────
 
@@ -12,6 +12,18 @@ import { apiFetch } from "./api-client.js";
  */
 const PROJECT_ID_DESCRIPTION =
   "Project to read. Optional: defaults to the project this server was started with. Only pass it to target a different project.";
+
+/**
+ * The docs' reading language, not a programming language: `get_sdk_methods`
+ * already has `language` for that, so this one is named for what the public
+ * routes take. Which languages a project serves changes per project and plan,
+ * so the schema can't list them; list_endpoints prints them instead.
+ */
+const LOCALE_PROPERTY = {
+  type: "string",
+  description:
+    "Language to read the docs in, as a language tag such as `fr` or `pt-BR`. Optional: defaults to the docs' source language. list_endpoints names the languages these docs are published in.",
+} as const;
 
 const DOCS_TOOLS: Tool[] = [
   {
@@ -32,6 +44,7 @@ const DOCS_TOOLS: Tool[] = [
           type: "number",
           description: "Maximum number of results to return (default 5)",
         },
+        locale: LOCALE_PROPERTY,
       },
       required: ["query"],
     },
@@ -50,6 +63,7 @@ const DOCS_TOOLS: Tool[] = [
           type: "string",
           description: "The endpoint slug",
         },
+        locale: LOCALE_PROPERTY,
       },
       required: ["slug"],
     },
@@ -69,6 +83,7 @@ const DOCS_TOOLS: Tool[] = [
           type: "string",
           description: "Only the sections whose name contains this text",
         },
+        locale: LOCALE_PROPERTY,
       },
       required: [],
     },
@@ -87,6 +102,7 @@ const DOCS_TOOLS: Tool[] = [
           type: "boolean",
           description: "Only return entries with breaking changes (default false)",
         },
+        locale: LOCALE_PROPERTY,
       },
       required: [],
     },
@@ -123,6 +139,7 @@ const DOCS_TOOLS: Tool[] = [
           type: "string",
           description: "The guide's group (list_endpoints shows it). Optional: found from the site's navigation when omitted.",
         },
+        locale: LOCALE_PROPERTY,
       },
       required: ["slug"],
     },
@@ -171,6 +188,92 @@ export const TOOLS: Tool[] = DOCS_TOOLS.map((tool) => ({
   annotations: { title: tool.name, ...DOCS_TOOL_ANNOTATIONS },
 }));
 
+// ─── Reading language ──────────────────────────────────────────────────────────
+
+/** `locale=…` after `separator`, or nothing for the source language. */
+function localeParam(locale: string | undefined, separator: "?" | "&"): string {
+  return locale !== undefined ? `${separator}locale=${encodeURIComponent(locale)}` : "";
+}
+
+/** The languages the public `/meta` route says these docs are served in. */
+export interface DocsLanguages {
+  sourceLocale: string;
+  /** Live target languages, in the owner's order. */
+  locales: string[];
+}
+
+interface MetaResponse {
+  localization?: DocsLanguages;
+}
+
+/**
+ * The served languages, or null for docs in their source language only. Only
+ * ever a hint beside another answer, so a failed read (already logged by
+ * apiFetch) leaves the hint out rather than failing that answer.
+ */
+async function fetchLanguages(apiUrl: string, projectId: string): Promise<DocsLanguages | null> {
+  try {
+    const meta = await apiFetch<MetaResponse>(`${apiUrl}/public/docs/${encodeURIComponent(projectId)}/meta`);
+    return meta.localization ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function languageList(languages: DocsLanguages): string {
+  return [`\`${languages.sourceLocale}\` (source)`, ...languages.locales.map((l) => `\`${l}\``)].join(", ");
+}
+
+/** The line list_endpoints adds for docs published in more than one language. */
+export function formatLanguages(languages: DocsLanguages | null): string {
+  if (languages === null || languages.locales.length === 0) return "";
+  return `**Languages:** ${languageList(languages)}. Pass \`locale\` to read the docs in one of them.`;
+}
+
+/**
+ * Runs a read in `locale`. A language the docs aren't published in answers
+ * 404 like a wrong slug would, so it is turned into an error that names the
+ * languages they are published in.
+ */
+async function readIn<T>(apiUrl: string, projectId: string, locale: string | undefined, read: () => Promise<T>): Promise<T> {
+  try {
+    return await read();
+  } catch (err) {
+    if (locale === undefined || !(err instanceof ApiError) || err.code !== "LOCALE_NOT_SERVED") throw err;
+    const languages = await fetchLanguages(apiUrl, projectId);
+    const published = languages !== null ? ` They are published in ${languageList(languages)}.` : "";
+    throw new Error(`These docs are not published in \`${locale}\`.${published} Leave \`locale\` out to read the source language.`);
+  }
+}
+
+/** What the page routes send beside a page read in another language. */
+export interface PageLocalization {
+  locale: string;
+  sourceLocale: string;
+  /** Passages on the page, and how many of them are translated. */
+  total: number;
+  translated: number;
+  /** Too little is translated: the page is served in the source language. */
+  fallback: boolean;
+}
+
+/**
+ * A line above a page that isn't fully in the language asked for. Without it
+ * an agent asked to answer in French would quote English text as the French
+ * docs.
+ */
+export function localizationNotice(localization: PageLocalization | undefined): string {
+  if (localization === undefined) return "";
+  const { locale, sourceLocale, total, translated } = localization;
+  if (localization.fallback) {
+    return `> Not translated into \`${locale}\` yet: this page is in the source language, \`${sourceLocale}\`.\n\n`;
+  }
+  if (translated < total) {
+    return `> Partly translated into \`${locale}\` (${translated} of ${total} passages): the rest is in \`${sourceLocale}\`.\n\n`;
+  }
+  return "";
+}
+
 // ─── Tool: search_docs ─────────────────────────────────────────────────────────
 
 interface SearchResult {
@@ -215,9 +318,12 @@ export async function searchDocs(
   projectId: string,
   query: string,
   limit: number,
+  locale?: string,
 ): Promise<string> {
-  const all = await apiFetch<SearchResult[]>(
-    `${apiUrl}/public/docs/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(query)}`,
+  const all = await readIn(apiUrl, projectId, locale, () =>
+    apiFetch<SearchResult[]>(
+      `${apiUrl}/public/docs/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(query)}${localeParam(locale, "&")}`,
+    ),
   );
   return formatSearchResults(all.slice(0, limit));
 }
@@ -276,6 +382,8 @@ interface PageResponse {
   page: DocPage;
   project: { name: string };
   spec: { version: string | null };
+  /** Present when the page was read in another language. */
+  localization?: PageLocalization;
 }
 
 /** " *(required)*: description", or the parts of it a field has. */
@@ -358,11 +466,14 @@ export async function getEndpoint(
   apiUrl: string,
   projectId: string,
   slug: string,
+  locale?: string,
 ): Promise<string> {
-  const data = await apiFetch<PageResponse>(
-    `${apiUrl}/public/docs/${encodeURIComponent(projectId)}/pages/${encodeURIComponent(slug)}`,
+  const data = await readIn(apiUrl, projectId, locale, () =>
+    apiFetch<PageResponse>(
+      `${apiUrl}/public/docs/${encodeURIComponent(projectId)}/pages/${encodeURIComponent(slug)}${localeParam(locale, "?")}`,
+    ),
   );
-  return formatEndpoint(data);
+  return localizationNotice(data.localization) + formatEndpoint(data);
 }
 
 // ─── Tool: list_endpoints ──────────────────────────────────────────────────────
@@ -452,16 +563,24 @@ export function formatNav(data: NavResponse, section: string | undefined): strin
   return lead + blocks.join("\n\n");
 }
 
-async function fetchNav(apiUrl: string, projectId: string): Promise<NavResponse> {
-  return apiFetch<NavResponse>(`${apiUrl}/public/docs/${encodeURIComponent(projectId)}/nav`);
+async function fetchNav(apiUrl: string, projectId: string, locale?: string): Promise<NavResponse> {
+  return apiFetch<NavResponse>(`${apiUrl}/public/docs/${encodeURIComponent(projectId)}/nav${localeParam(locale, "?")}`);
 }
 
 export async function listEndpoints(
   apiUrl: string,
   projectId: string,
   section: string | undefined,
+  locale?: string,
 ): Promise<string> {
-  return formatNav(await fetchNav(apiUrl, projectId), section);
+  // The languages line is how an agent learns what `locale` can be.
+  const [nav, languages] = await Promise.all([
+    readIn(apiUrl, projectId, locale, () => fetchNav(apiUrl, projectId, locale)),
+    fetchLanguages(apiUrl, projectId),
+  ]);
+  const listing = formatNav(nav, section);
+  const languagesLine = formatLanguages(languages);
+  return languagesLine !== "" ? `${listing}\n\n${languagesLine}` : listing;
 }
 
 // ─── Tool: get_changelog ───────────────────────────────────────────────────────
@@ -605,20 +724,26 @@ export async function getChangelog(
   apiUrl: string,
   projectId: string,
   breakingOnly: boolean,
+  locale?: string,
 ): Promise<string> {
   const base = `${apiUrl}/public/changelog/${encodeURIComponent(projectId)}`;
   const data = await apiFetch<ChangelogListResponse>(base);
   // The list carries each entry's heading only; what changed is on the entry's
-  // own route. Fetch it for the few entries shown, keeping the heading when one fails.
+  // own route, which is also the one that translates. Fetch it for the few
+  // entries shown, keeping the heading when one fails, except for a language
+  // the docs aren't in: the heading alone would pass the source text off as it.
   const shown = (breakingOnly ? data.changelogs.filter((e) => e.hasBreakingChanges) : data.changelogs).slice(0, 3);
-  const detailed = await Promise.all(
-    shown.map(async (entry) => {
-      try {
-        return { ...entry, ...(await apiFetch<ChangelogEntry>(`${base}/${encodeURIComponent(entry.id)}`)) };
-      } catch {
-        return entry;
-      }
-    }),
+  const detailed = await readIn(apiUrl, projectId, locale, () =>
+    Promise.all(
+      shown.map(async (entry) => {
+        try {
+          return { ...entry, ...(await apiFetch<ChangelogEntry>(`${base}/${encodeURIComponent(entry.id)}${localeParam(locale, "?")}`)) };
+        } catch (err) {
+          if (err instanceof ApiError && err.code === "LOCALE_NOT_SERVED") throw err;
+          return entry;
+        }
+      }),
+    ),
   );
   return formatChangelog(detailed, breakingOnly, data.release);
 }
@@ -694,10 +819,13 @@ export async function getGuide(
   projectId: string,
   slug: string,
   groupSlug: string | undefined,
+  locale?: string,
 ): Promise<string> {
   const pid = encodeURIComponent(projectId);
   // A guide in a group is only served under its group, and models rarely pass
-  // one: the navigation says which group a slug belongs to.
+  // one: the navigation says which group a slug belongs to. Slugs and groups
+  // are the same in every language, and the source navigation lists a guide
+  // that a language's navigation may hide while it is untranslated.
   const group =
     groupSlug !== undefined && groupSlug !== ""
       ? groupSlug
@@ -709,10 +837,12 @@ export async function getGuide(
       ? `${apiUrl}/public/docs/${pid}/guides/${encodeURIComponent(group)}/${encodeURIComponent(slug)}`
       : `${apiUrl}/public/docs/${pid}/guides/${encodeURIComponent(slug)}`;
 
-  const data = await apiFetch<{ guide: PublicGuide }>(path);
+  const data = await readIn(apiUrl, projectId, locale, () =>
+    apiFetch<{ guide: PublicGuide; localization?: PageLocalization }>(`${path}${localeParam(locale, "?")}`),
+  );
   const guide = data.guide;
   const section = guide.group !== null ? `\n*Section: ${guide.group.title}*` : "";
-  return `# ${guide.title}${section}\n\n${htmlToText(guide.compiledHtml)}`;
+  return `${localizationNotice(data.localization)}# ${guide.title}${section}\n\n${htmlToText(guide.compiledHtml)}`;
 }
 
 // ─── Tool: get_sdk_methods ─────────────────────────────────────────────────────
@@ -805,28 +935,30 @@ export async function runDocsTool(
   apiUrl: string,
   projectId: string,
 ): Promise<string> {
+  // An empty tag is the source language, the same as leaving it out.
+  const locale = typeof a["locale"] === "string" && a["locale"].trim() !== "" ? a["locale"].trim() : undefined;
   switch (name) {
     case "search_docs": {
       const query = typeof a["query"] === "string" ? a["query"] : "";
       const limit = typeof a["limit"] === "number" ? a["limit"] : 5;
-      return searchDocs(apiUrl, projectId, query, limit);
+      return searchDocs(apiUrl, projectId, query, limit, locale);
     }
     case "get_endpoint": {
       const slug = typeof a["slug"] === "string" ? a["slug"] : "";
-      return getEndpoint(apiUrl, projectId, slug);
+      return getEndpoint(apiUrl, projectId, slug, locale);
     }
     case "list_endpoints": {
       const section = typeof a["section"] === "string" ? a["section"] : undefined;
-      return listEndpoints(apiUrl, projectId, section);
+      return listEndpoints(apiUrl, projectId, section, locale);
     }
     case "get_changelog":
-      return getChangelog(apiUrl, projectId, a["breakingOnly"] === true);
+      return getChangelog(apiUrl, projectId, a["breakingOnly"] === true, locale);
     case "list_sdks":
       return listSdks(apiUrl, projectId);
     case "get_guide": {
       const slug = typeof a["slug"] === "string" ? a["slug"] : "";
       const groupSlug = typeof a["groupSlug"] === "string" ? a["groupSlug"] : undefined;
-      return getGuide(apiUrl, projectId, slug, groupSlug);
+      return getGuide(apiUrl, projectId, slug, groupSlug, locale);
     }
     case "get_sdk_methods": {
       const slug = typeof a["slug"] === "string" ? a["slug"] : undefined;

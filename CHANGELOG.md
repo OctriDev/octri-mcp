@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The docs tools read translated docs. `search_docs`, `get_endpoint`,
+  `list_endpoints`, `get_guide` and `get_changelog` take `locale` (such as
+  `fr`); without it they read the source language, as before.
+  `list_endpoints` ends with the languages the docs are published in. A page
+  that isn't fully translated yet starts with a line saying so, and a language
+  the docs aren't published in is an error that names the ones they are.
+
 ## 1.4.2
 
 - The docs tools read what the docs site serves. `list_endpoints` walks every

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 
 import {
   formatChangelog,
@@ -9,6 +9,8 @@ import {
   formatSearchResults,
   htmlToText,
   type NavResponse,
+  runDocsTool,
+  TOOLS,
 } from "./docs-tools.js";
 
 const guide = (slug: string, groupSlug: string) => ({ slug, title: slug, type: "guide", groupSlug });
@@ -228,5 +230,120 @@ describe("reading a guide found by search_docs or list_endpoints", () => {
   it("keeps a guide's headings and bullets when it turns the page into text", () => {
     const text = htmlToText("<h2 id=\"setup\">Setup</h2><p>Install it.</p><ul><li>One</li><li>Two</li></ul><h3>Next</h3>");
     assert.equal(text, "## Setup\nInstall it.\n\n- One\n- Two\n\n### Next");
+  });
+});
+
+describe("reading the docs in another language", () => {
+  const API = "https://api.test";
+  const NOT_SERVED = { status: 404, body: { error: { code: "LOCALE_NOT_SERVED", message: "These docs are not published in that language." } } };
+  const META = { status: 200, body: { title: "Acme", localization: { sourceLocale: "en", locales: ["fr", "pt-BR"], suspended: [] } } };
+  const page = (localization?: object) => ({
+    status: 200,
+    body: {
+      project: { name: "Acme" },
+      spec: { version: "2.0.0" },
+      page: { slug: "get-users", title: "Lister les utilisateurs", method: "GET", path: "/users", content: { description: "Renvoie les utilisateurs." } },
+      ...(localization !== undefined ? { localization } : {}),
+    },
+  });
+
+  type Answer = { status: number; body: unknown };
+  let answers: [RegExp, Answer][] = [];
+  let requested: string[] = [];
+  const realFetch = globalThis.fetch;
+  const stub: typeof fetch = async (input) => {
+    const url = input instanceof Request ? input.url : String(input);
+    requested.push(url.slice(API.length));
+    const answer = answers.find(([pattern]) => pattern.test(url))?.[1];
+    if (answer === undefined) throw new Error(`unexpected request ${url}`);
+    return new Response(JSON.stringify(answer.body), { status: answer.status, headers: { "Content-Type": "application/json" } });
+  };
+  beforeEach(() => {
+    answers = [];
+    requested = [];
+    globalThis.fetch = stub;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("offers locale on the five tools that read the docs' text, and not on the SDK ones", () => {
+    const withLocale = TOOLS.filter((t) => t.inputSchema.properties?.["locale"] !== undefined).map((t) => t.name);
+    assert.deepEqual(withLocale.sort(), ["get_changelog", "get_endpoint", "get_guide", "list_endpoints", "search_docs"]);
+  });
+
+  it("asks the page route for the language and says when the page is still in the source language", async () => {
+    answers = [[/\/pages\//, page({ locale: "fr", sourceLocale: "en", total: 12, translated: 1, fallback: true, missing: [] })]];
+    const text = await runDocsTool("get_endpoint", { slug: "get-users", locale: "fr" }, API, "p1");
+    assert.deepEqual(requested, ["/public/docs/p1/pages/get-users?locale=fr"]);
+    assert.match(text, /^> Not translated into `fr` yet: this page is in the source language, `en`\.\n\n# Lister les utilisateurs/);
+  });
+
+  it("says how much of a partly translated page is still in the source language", async () => {
+    answers = [[/\/pages\//, page({ locale: "fr", sourceLocale: "en", total: 12, translated: 9, fallback: false, missing: ["description"] })]];
+    const text = await runDocsTool("get_endpoint", { slug: "get-users", locale: "fr" }, API, "p1");
+    assert.match(text, /^> Partly translated into `fr` \(9 of 12 passages\): the rest is in `en`\./);
+  });
+
+  it("adds no line to a fully translated page, and sends no locale when none or an empty one is given", async () => {
+    answers = [[/\/pages\//, page({ locale: "fr", sourceLocale: "en", total: 12, translated: 12, fallback: false, missing: [] })]];
+    assert.match(await runDocsTool("get_endpoint", { slug: "get-users", locale: "fr" }, API, "p1"), /^# Lister/);
+    answers = [[/\/pages\//, page()]];
+    await runDocsTool("get_endpoint", { slug: "get-users", locale: "  " }, API, "p1");
+    await runDocsTool("get_endpoint", { slug: "get-users" }, API, "p1");
+    assert.deepEqual(requested.slice(1), ["/public/docs/p1/pages/get-users", "/public/docs/p1/pages/get-users"]);
+  });
+
+  it("names the languages the docs are published in at the end of list_endpoints", async () => {
+    answers = [
+      [/\/nav/, { status: 200, body: { sections: [{ title: "Utilisateurs", items: [{ slug: "get-users", title: "Lister", method: "GET", path: "/users" }] }] } }],
+      [/\/meta$/, META],
+    ];
+    const text = await runDocsTool("list_endpoints", { locale: "fr" }, API, "p1");
+    assert.ok(requested.includes("/public/docs/p1/nav?locale=fr"));
+    assert.match(text, /### Utilisateurs/);
+    assert.match(text, /\n\n\*\*Languages:\*\* `en` \(source\), `fr`, `pt-BR`\. Pass `locale` to read the docs in one of them\.$/);
+  });
+
+  it("adds no languages line for docs in one language, or when the languages can't be read", async () => {
+    const nav: Answer = { status: 200, body: { sections: [{ title: "Users", items: [{ slug: "get-users", title: "List", method: "GET", path: "/users" }] }] } };
+    answers = [[/\/nav/, nav], [/\/meta$/, { status: 200, body: { title: "Acme" } }]];
+    assert.doesNotMatch(await runDocsTool("list_endpoints", {}, API, "p1"), /Languages/);
+    answers = [[/\/nav/, nav], [/\/meta$/, { status: 500, body: {} }]];
+    assert.doesNotMatch(await runDocsTool("list_endpoints", {}, API, "p1"), /Languages/);
+  });
+
+  it("turns a language the docs aren't published in into an error naming the ones they are", async () => {
+    answers = [[/\/search\?/, NOT_SERVED], [/\/meta$/, META]];
+    await assert.rejects(
+      runDocsTool("search_docs", { query: "users", locale: "de" }, API, "p1"),
+      { message: "These docs are not published in `de`. They are published in `en` (source), `fr`, `pt-BR`. Leave `locale` out to read the source language." },
+    );
+    assert.equal(requested[0], "/public/docs/p1/search?q=users&locale=de");
+  });
+
+  it("keeps the slug advice for a 404 that isn't about the language", async () => {
+    answers = [[/\/pages\//, { status: 404, body: { error: { code: "NOT_FOUND", message: "Page not found." } } }]];
+    await assert.rejects(runDocsTool("get_endpoint", { slug: "nope", locale: "fr" }, API, "p1"), /Check the slug and projectId/);
+  });
+
+  it("finds a guide's group in the source navigation and reads the guide in the language", async () => {
+    answers = [
+      [/\/nav$/, { status: 200, body: { sections: [{ title: "Start", items: [{ slug: "quickstart", title: "Quickstart", type: "guide", groupSlug: "start" }] }] } }],
+      [/\/guides\//, { status: 200, body: { guide: { slug: "quickstart", title: "Démarrage rapide", compiledHtml: "<p>Installez-le.</p>", group: { slug: "start", title: "Commencer" } } } }],
+    ];
+    const text = await runDocsTool("get_guide", { slug: "quickstart", locale: "fr" }, API, "p1");
+    assert.deepEqual(requested, ["/public/docs/p1/nav", "/public/docs/p1/guides/start/quickstart?locale=fr"]);
+    assert.equal(text, "# Démarrage rapide\n*Section: Commencer*\n\nInstallez-le.");
+  });
+
+  it("reads changelog entries in the language and doesn't fall back to the headings for one the docs aren't in", async () => {
+    const list: Answer = { status: 200, body: { changelogs: [{ id: "c1", fromVersion: "1.0.0", toVersion: "2.0.0", hasBreakingChanges: false, summary: { added: 1, removed: 0, modified: 0, breaking: 0 }, generatedAt: "2026-11-01T00:00:00.000Z" }] } };
+    answers = [[/\/changelog\/p1$/, list], [/\/changelog\/p1\/c1/, { status: 200, body: { changes: [] } }]];
+    await runDocsTool("get_changelog", { locale: "fr" }, API, "p1");
+    assert.deepEqual(requested, ["/public/changelog/p1", "/public/changelog/p1/c1?locale=fr"]);
+
+    answers = [[/\/changelog\/p1$/, list], [/\/changelog\/p1\/c1/, NOT_SERVED], [/\/meta$/, META]];
+    await assert.rejects(runDocsTool("get_changelog", { locale: "de" }, API, "p1"), /not published in `de`/);
   });
 });
