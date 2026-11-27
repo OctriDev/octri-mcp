@@ -133,9 +133,38 @@ describe("search ranking", () => {
     assert.equal(search("repo fork")[0], "reposCreateFork");
   });
 
-  it("sinks deprecated operations below current ones", () => {
-    const forks = search("forks");
-    assert.ok(forks.indexOf("reposCreateFork") < forks.indexOf("reposListForks"));
+  it("sinks deprecated operations below current ones, out of the close matches", () => {
+    assert.deepEqual(search("forks"), ["reposCreateFork"]);
+    const current = GITHUB.map((t) => (t.deprecated ? { ...t, deprecated: false, description: "List forks." } : t));
+    assert.deepEqual(names(searchTools(buildToolIndex(current), "forks").matches), ["reposCreateFork", "reposListForks"]);
+  });
+
+  it("ranks by the summary over a name that repeats more of the query", () => {
+    // Operation IDs and summaries from GitHub's spec. Weighting the name highest put the commit operation first.
+    const tools = [
+      op("agent-automations_list-automations", "GET", "/agents/automations", "List automations for user"),
+      op("apps_create-installation-access-token", "POST", "/app/installations/{installation_id}/access_tokens", "Create an installation access token for an app"),
+      op("apps_list-accounts-for-plan", "GET", "/marketplace_listing/plans/{plan_id}/accounts", "List accounts for a plan"),
+      op("dependabot_update-repository-access-for-org", "PATCH", "/orgs/{org}/dependabot/repository-access", "Updates Dependabot's repository access list for an organization"),
+      op("teams_list-members-in-org", "GET", "/orgs/{org}/teams/{team_slug}/members", "List team members"),
+      op("repos_list-pull-requests-associated-with-commit", "GET", "/repos/{owner}/{repo}/commits/{commit_sha}/pulls", "List pull requests associated with a commit"),
+      op("issues_delete-issue-field-value", "DELETE", "/repos/{owner}/{repo}/issues/{issue_number}/issue-field-values/{issue_field_id}", "Delete an issue field value from an issue"),
+      op("pulls_list", "GET", "/repos/{owner}/{repo}/pulls", "List pull requests"),
+      op("reactions_list-for-pull-request-review-comment", "GET", "/repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions", "List reactions for a pull request review comment"),
+    ];
+    const ranked = (query: string) => names(searchTools(buildToolIndex(tools), query).matches)[0];
+    assert.equal(ranked("list pull requests"), "pulls_list");
+    // An owner who weights the name highest gets that ranking back.
+    const byName = buildToolIndex(tools, { summary: 2, name: 5, path: 3, description: 1 });
+    assert.equal(names(searchTools(byName, "list pull requests").matches)[0], "repos_list-pull-requests-associated-with-commit");
+    assert.equal(ranked("list pull requests associated with a commit"), "repos_list-pull-requests-associated-with-commit");
+    assert.equal(ranked("list reactions for a pull request review comment"), "reactions_list-for-pull-request-review-comment");
+  });
+
+  it("returns only the matches within 30% of the best one", () => {
+    assert.deepEqual(search("list pull requests"), ["pullsList"]);
+    assert.deepEqual(search("pull"), ["pullsList", "pullsMerge"]);
+    assert.equal(searchTools(index, "list pull requests").total, 1);
   });
 
   it("finds an operation by its exact name", () => {

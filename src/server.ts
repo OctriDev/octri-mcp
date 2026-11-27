@@ -612,7 +612,7 @@ export function createServer(options: CreateServerOptions): Server {
   };
   const indexOf = (data: ToolManifest): ToolIndex => {
     const entry = visibleOf(data);
-    entry.index ??= buildToolIndex(entry.tools);
+    entry.index ??= buildToolIndex(entry.tools, data.searchWeights);
     return entry.index;
   };
   /** The script languages this server offers: what the owner published, that the sandbox runs. */

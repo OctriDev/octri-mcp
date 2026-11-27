@@ -9,6 +9,7 @@ import type { ToolChanges } from "./changes.js";
 import type { ToolGroup } from "./groups.js";
 import type { ToolLimits } from "./limits.js";
 import type { PromptTemplate } from "./prompts.js";
+import type { SearchWeights } from "./tool-search.js";
 import type { ResourceEntry } from "./resources.js";
 import type { ToolPolicy } from "./permissions.js";
 import { encodeQuerystring } from "./querystring.js";
@@ -122,6 +123,8 @@ export interface McpToolsResponse {
   toolMode?: ToolMode;
   /** Visible tools above which automatic searches. Absent: `SEARCH_MODE_THRESHOLD`. */
   searchThreshold?: number;
+  /** How search ranks operations. Absent: `DEFAULT_SEARCH_WEIGHTS`. */
+  searchWeights?: SearchWeights;
   /** False when the owner turned outage warnings off. Absent: on. */
   outageWarnings?: false;
   /** The project's error guides per status or class, under each tool's own. Absent: none. */

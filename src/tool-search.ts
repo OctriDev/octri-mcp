@@ -62,9 +62,11 @@ export function isMetaTool(name: string): boolean {
   return META_TOOLS.has(name);
 }
 
-/** How many results one search returns by default, and at most. */
+/** How many operations browsing a group returns by default, and how many any one page holds at most. */
 export const SEARCH_DEFAULT_LIMIT = 10;
 export const SEARCH_MAX_LIMIT = 25;
+/** A search returns the matches scoring within 30% of the best one, however many that is. */
+const MATCH_FLOOR = 0.7;
 /** Operations one `describe_tool` call returns at most. */
 export const DESCRIBE_MAX = 5;
 
@@ -97,7 +99,7 @@ export function searchModeTools(visible: readonly OperationTool[]): Tool[] {
       name: SEARCH_TOOLS,
       description:
         `Find this API's operations by keyword. It has ${total} operations, too many to list up front, so they are found here. ` +
-        "Matches operation names, descriptions, paths and groups, best first, one line each with the required arguments. " +
+        "Matches operation summaries, names, paths and descriptions, and returns only the close matches, best first, one line each with the required arguments. " +
         `Then call ${DESCRIBE_TOOL} for the input schema of the ones you need, and ${CALL_TOOL} to run one.` +
         (grouped ? ` Pass a group from ${LIST_TOOL_GROUPS}, with or without a query, to browse it.` : ""),
       inputSchema: {
@@ -114,7 +116,7 @@ export function searchModeTools(visible: readonly OperationTool[]): Tool[] {
             type: "integer",
             minimum: 1,
             maximum: SEARCH_MAX_LIMIT,
-            description: `How many results to return. Default ${SEARCH_DEFAULT_LIMIT}.`,
+            description: `How many results to return. Default: every close match, up to ${SEARCH_MAX_LIMIT}.`,
           },
           offset: { type: "integer", minimum: 0, description: "Skip this many results, to page through a long match." },
         },
@@ -230,9 +232,28 @@ export function searchTerms(text: string): string[] {
     .map(stem);
 }
 
-/** How much a hit in each field counts. A name says the most about what a tool does. */
-const FIELD_WEIGHTS = { name: 5, group: 3, path: 3, summary: 2, body: 1 } as const;
-type Field = keyof typeof FIELD_WEIGHTS;
+/** How much a match in each part of an operation counts. Mirrors `McpSearchWeights` in @octri/shared. */
+export interface SearchWeights {
+  summary: number;
+  name: number;
+  path: number;
+  description: number;
+}
+
+/**
+ * Mirrors `MCP_SEARCH_WEIGHTS`. The summary says the most about what an operation does; a long description
+ * mentions every related resource, so it counts least. On GitHub's 1,281 operations, weighting the name highest
+ * ranked "list pull requests" behind three related operations.
+ */
+export const DEFAULT_SEARCH_WEIGHTS: SearchWeights = { summary: 3, name: 1, path: 0.5, description: 0.25 };
+
+const FIELDS = ["name", "group", "path", "summary", "body"] as const;
+type Field = (typeof FIELDS)[number];
+
+/** The weight of each indexed field. A group is part of the route, so it counts like the path. */
+function fieldWeights(w: SearchWeights): Record<Field, number> {
+  return { summary: w.summary, name: w.name, group: w.path, path: w.path, body: w.description };
+}
 
 /** Verbs in a query that say which HTTP methods the agent means. */
 const VERB_METHODS: [RegExp, readonly string[]][] = [
@@ -260,6 +281,7 @@ export interface ToolIndex {
   /** Mean length of each field in words, so a hit in a short field counts for more. */
   averageLength: Record<Field, number>;
   byName: Map<string, OperationTool>;
+  weights: Record<Field, number>;
 }
 
 function termCounts(text: string): IndexedField {
@@ -281,7 +303,7 @@ export function summaryLine(description: string, max = 160): string {
   return sentence.length > max ? `${sentence.slice(0, max - 1).trimEnd()}…` : sentence;
 }
 
-export function buildToolIndex(tools: readonly OperationTool[]): ToolIndex {
+export function buildToolIndex(tools: readonly OperationTool[], weights: SearchWeights = DEFAULT_SEARCH_WEIGHTS): ToolIndex {
   const frequency = new Map<string, number>();
   const indexed = tools.map((tool, position) => {
     const summary = summaryLine(tool.description, Number.MAX_SAFE_INTEGER);
@@ -299,11 +321,17 @@ export function buildToolIndex(tools: readonly OperationTool[]): ToolIndex {
     return { tool, position, fields };
   });
   const averageLength = {} as Record<Field, number>;
-  for (const field of Object.keys(FIELD_WEIGHTS) as Field[]) {
+  for (const field of FIELDS) {
     const total = indexed.reduce((sum, entry) => sum + entry.fields[field].length, 0);
     averageLength[field] = indexed.length > 0 ? Math.max(total / indexed.length, 1) : 1;
   }
-  return { tools: indexed, frequency, averageLength, byName: new Map(tools.map((t) => [t.name, t])) };
+  return {
+    tools: indexed,
+    frequency,
+    averageLength,
+    byName: new Map(tools.map((t) => [t.name, t])),
+    weights: fieldWeights(weights),
+  };
 }
 
 export interface SearchOptions {
@@ -332,15 +360,16 @@ function inGroup(tool: OperationTool, group: string): boolean {
  * hit, saturated so a word repeated in a long description cannot outrank a
  * name, and scaled by field length so a short name that is exactly the query
  * beats a long one that merely contains it. Tools matching more of the query come first; a verb like "create" lifts
- * the operations whose method does that; deprecated ones sink.
+ * the operations whose method does that; deprecated ones sink. Only the close matches are returned (MATCH_FLOOR).
  */
 export function searchTools(index: ToolIndex, query: string, options: SearchOptions = {}): SearchResult {
-  const limit = Math.min(Math.max(Math.trunc(options.limit ?? SEARCH_DEFAULT_LIMIT), 1), SEARCH_MAX_LIMIT);
   const offset = Math.max(Math.trunc(options.offset ?? 0), 0);
   const group = options.group?.trim() ?? "";
   const pool = group === "" ? index.tools : index.tools.filter((t) => inGroup(t.tool, group));
 
   const terms = [...new Set(searchTerms(query))];
+  const fallback = terms.length === 0 ? SEARCH_DEFAULT_LIMIT : SEARCH_MAX_LIMIT;
+  const limit = Math.min(Math.max(Math.trunc(options.limit ?? fallback), 1), SEARCH_MAX_LIMIT);
   if (terms.length === 0) {
     // Browsing a group: every member, in the API's own order.
     const all = group === "" ? [] : pool.map((t) => t.tool);
@@ -360,12 +389,12 @@ export function searchTools(index: ToolIndex, query: string, options: SearchOpti
     let matched = 0;
     for (const term of terms) {
       let hit = 0;
-      for (const field of Object.keys(FIELD_WEIGHTS) as Field[]) {
+      for (const field of FIELDS) {
         const { counts, length } = entry.fields[field];
         const tf = counts.get(term) ?? 0;
         if (tf === 0) continue;
         const norm = 1 - LENGTH_WEIGHT + (LENGTH_WEIGHT * length) / index.averageLength[field];
-        hit += (FIELD_WEIGHTS[field] * tf * (SATURATION + 1)) / (tf + SATURATION * norm);
+        hit += (index.weights[field] * tf * (SATURATION + 1)) / (tf + SATURATION * norm);
       }
       if (hit === 0) continue;
       matched += 1;
@@ -380,7 +409,9 @@ export function searchTools(index: ToolIndex, query: string, options: SearchOpti
     scored.push({ tool: entry.tool, score, position: entry.position });
   }
   scored.sort((a, b) => b.score - a.score || a.position - b.position);
-  return { matches: scored.slice(offset, offset + limit).map((s) => s.tool), total: scored.length };
+  const floor = (scored[0]?.score ?? 0) * MATCH_FLOOR;
+  const close = scored.filter((s) => s.score >= floor);
+  return { matches: close.slice(offset, offset + limit).map((s) => s.tool), total: close.length };
 }
 
 // ─── Result text ───────────────────────────────────────────────────────────────

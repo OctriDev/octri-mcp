@@ -163,6 +163,18 @@ describe("search mode", () => {
       await client.close();
     });
 
+    it("ranks by the owner's search weights", async () => {
+      const shop = { ...manifest, tools: [...manifest.tools, tool("shopHours", "GET", "auto", { description: "Opening hours." })] };
+      const firstFor = async (own: ToolManifest) => {
+        const { client } = await connect({ manifest: own });
+        const found = text(await client.callTool({ name: "search_tools", arguments: { query: "shop" } }));
+        await client.close();
+        return (found.split("\n")[2] ?? "").split(" · ")[0];
+      };
+      assert.equal(await firstFor(shop), "listPets");
+      assert.equal(await firstFor({ ...shop, searchWeights: { summary: 0, name: 1, path: 0, description: 0 } }), "shopHours");
+    });
+
     it("leaves a denied operation out of search", async () => {
       const permissions = loadUserPermissions(["--deny-tools", "deletePet"], { prefix: "ACME", vars: {} });
       const { client } = await connect({ permissions });
