@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
+## 1.5.0
 
+- `search_tools` ranks a match in an operation's summary first, then its tool
+  name, path and description, and returns the matches close to the best one
+  (up to 25 a page) instead of a fixed 10. Owners can change the four weights
+  in the dashboard; they reach this package with the other MCP settings.
 - The docs tools read translated docs. `search_docs`, `get_endpoint`,
   `list_endpoints`, `get_guide` and `get_changelog` take `locale` (such as
   `fr`); without it they read the source language, as before.
